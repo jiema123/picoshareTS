@@ -1,0 +1,9 @@
+node_modules
+.git
+.gitignore
+.wrangler
+coverage
+dist
+*.log
+docs/screenshots
+

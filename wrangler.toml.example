@@ -1,0 +1,17 @@
+name = "picoshare-ts"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+assets = { directory = "./public" }
+
+[vars]
+# Put the real value in local wrangler.toml or via `wrangler secret put`
+PS_SHARED_SECRET = "replace-me"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "picoshare_db"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "picoshare-files"
