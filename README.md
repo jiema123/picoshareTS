@@ -120,6 +120,11 @@ Then open `http://localhost:8787`.
 
 ![File Information EN](https://img.justnow.uk/2026/02/baa9bfe8fefeef92611b730a4d1ab37d.png)
 
+
+### Clips
+![clips](https://img.justnow.uk/2026/02/ad69a9240443e23109197cad0976726c.png)
+![clips1](https://img.justnow.uk/2026/02/4baa1ebde0cc84210b1021e7b820588b.png)
+
 ## Notes
 
 - Current project directory is a Worker app root; run commands in this folder.
