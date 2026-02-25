@@ -9,6 +9,10 @@ A lightweight file sharing service built on Cloudflare Workers + D1 + R2.
 - Password-protected management UI
 - File upload via select, drag-and-drop, and paste text
 - File list, metadata, edit, and delete
+- Cloud clipboard (`/clips` + `/:name`) for quick text sync across devices
+  - Per-clipboard password protection
+  - Auto-save (including save on mouse leave)
+  - Shareable URL editing on multiple devices
 - Guest link upload flow (supports batch upload)
 - Download history tracking and view
 - CN/EN language switch
@@ -48,6 +52,20 @@ npx wrangler d1 execute picoshare_db --local --file=./schema.sql
 npx wrangler dev --port 8788
 ```
 
+5. Create KV namespace for clips and set `CLIPBOARD` in `wrangler.toml`:
+
+```bash
+npx wrangler kv namespace create "picoshare-clips"
+```
+
+Then copy the returned `id` into:
+
+```toml
+[[kv_namespaces]]
+binding = "CLIPBOARD"
+id = "your-kv-namespace-id"
+```
+
 ## Docker Deployment (Local Runtime)
 
 This mode runs Worker + local D1/R2 in container only (no Cloudflare remote dependency).
@@ -78,6 +96,7 @@ Then open `http://localhost:8787`.
 
 - See `docs/CONFIG_TEMPLATE.md` for local/production configuration and secret management.
 - Never commit real secrets in `.dev.vars`, `.env`, private keys, or cert files.
+- `CLIPBOARD` KV binding is required for `/clips` and `/:name` clipboard pages.
 
 
 

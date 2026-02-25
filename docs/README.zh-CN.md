@@ -2,6 +2,14 @@
 
 基于 Cloudflare Workers + D1 + R2 的轻量文件分享服务。
 
+## 功能补充：云便签（Clips）
+
+- 列表页：`/clips`
+- 详情页：`/:名字`（例如 `/jiema66`）
+- 支持多设备共享同一地址编辑
+- 支持便签独立密码保护
+- 支持自动保存（含鼠标移出页面自动保存）
+
 ## 1. 环境准备
 
 1. 安装 Node.js（建议 `>=18`）。
@@ -45,6 +53,20 @@ npx wrangler r2 bucket create picoshare-files
 
 把 Bucket 名称写入 `wrangler.toml` 的 `[[r2_buckets]]`。
 
+### 2.3 创建 KV（用于云便签 Clips）
+
+```bash
+npx wrangler kv namespace create "picoshare-clips"
+```
+
+把返回的 `id` 写入 `wrangler.toml` 的 `[[kv_namespaces]]`：
+
+```toml
+[[kv_namespaces]]
+binding = "CLIPBOARD"
+id = "你的_KV_ID"
+```
+
 ## 3. 本地配置
 
 1. 从模板生成配置文件：
@@ -59,6 +81,7 @@ cp .dev.vars.example .dev.vars
 - `wrangler.toml`：
   - `database_id` 改为你创建的 D1 ID
   - `bucket_name` 改为你创建的 R2 名称
+  - `kv_namespaces` 的 `CLIPBOARD` 改为你创建的 KV ID
 - `.dev.vars`：
   - `PS_SHARED_SECRET` 改为强口令
 
@@ -139,3 +162,4 @@ npx wrangler deployments list
 - `wrangler.toml`、`.dev.vars` 含敏感配置，不应提交到仓库。
 - 仅提交 `wrangler.toml.example`、`.dev.vars.example`。
 - 密钥泄露后请立即更换 `PS_SHARED_SECRET`。
+- 若仅文件分享可不使用 Clips，但启用 `/clips` 必须配置 `CLIPBOARD` KV 绑定。

@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  calculateClipboardStats,
+  clipboardPasswordStorageKey,
   cleanupExpiredEntries,
   escapeHtml,
   expirationToISO,
   isExpired,
+  normalizeClipboardPassword,
   parseDateFromUnknown,
   parseExpirationDays,
+  sanitizeClipboardSlug,
+  sha256Hex,
+  verifyClipboardPassword,
 } from "../src/index";
 
 describe("parseExpirationDays", () => {
@@ -118,5 +124,63 @@ describe("cleanupExpiredEntries", () => {
 
     const count = await cleanupExpiredEntries(env, "2026-02-11T00:00:00.000Z", 10);
     expect(count).toBe(0);
+  });
+});
+
+describe("sanitizeClipboardSlug", () => {
+  it("accepts readable names and normalizes spaces", () => {
+    expect(sanitizeClipboardSlug("Alice")).toBe("alice");
+    expect(sanitizeClipboardSlug("  Team Board  ")).toBe("team-board");
+    expect(sanitizeClipboardSlug("张三的便签")).toBe("张三的便签");
+    expect(sanitizeClipboardSlug("A_B-C")).toBe("a_b-c");
+  });
+
+  it("returns null for invalid or reserved names", () => {
+    expect(sanitizeClipboardSlug("")).toBeNull();
+    expect(sanitizeClipboardSlug("  ")).toBeNull();
+    expect(sanitizeClipboardSlug("api")).toBeNull();
+    expect(sanitizeClipboardSlug("guest")).toBeNull();
+    expect(sanitizeClipboardSlug("-hidden")).toBeNull();
+    expect(sanitizeClipboardSlug("a".repeat(65))).toBeNull();
+    expect(sanitizeClipboardSlug("name/with/slash")).toBeNull();
+    expect(sanitizeClipboardSlug("bad<script>")).toBeNull();
+  });
+});
+
+describe("calculateClipboardStats", () => {
+  it("returns stats for empty content", () => {
+    expect(calculateClipboardStats("")).toEqual({ itemCount: 0, lineCount: 0, charCount: 0 });
+    expect(calculateClipboardStats("   ")).toEqual({ itemCount: 0, lineCount: 0, charCount: 0 });
+  });
+
+  it("counts non-empty lines and chars", () => {
+    const text = "first line\n\nsecond line\n第三行";
+    expect(calculateClipboardStats(text)).toEqual({
+      itemCount: 3,
+      lineCount: 4,
+      charCount: text.length,
+    });
+  });
+});
+
+describe("clipboard password helpers", () => {
+  it("normalizes password with validation", () => {
+    expect(normalizeClipboardPassword("  abc123  ")).toBe("abc123");
+    expect(normalizeClipboardPassword("")).toBeNull();
+    expect(normalizeClipboardPassword("  ")).toBeNull();
+    expect(normalizeClipboardPassword("a".repeat(129))).toBeNull();
+    expect(normalizeClipboardPassword(123)).toBeNull();
+  });
+
+  it("hashes and verifies password", async () => {
+    const hash = await sha256Hex("my-secret");
+    expect(hash).toHaveLength(64);
+    expect(await verifyClipboardPassword(hash, "my-secret")).toBe(true);
+    expect(await verifyClipboardPassword(hash, "wrong")).toBe(false);
+  });
+
+  it("builds deterministic local storage key", () => {
+    expect(clipboardPasswordStorageKey("alice")).toBe("ps_clip_pw_alice");
+    expect(clipboardPasswordStorageKey("张三")).toBe("ps_clip_pw_%E5%BC%A0%E4%B8%89");
   });
 });

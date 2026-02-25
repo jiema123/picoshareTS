@@ -1,6 +1,7 @@
 export interface Env {
   DB: D1Database;
   BUCKET: R2Bucket;
+  CLIPBOARD: KVNamespace;
   PS_SHARED_SECRET: string;
 }
 
@@ -28,6 +29,32 @@ type GuestLinkRow = {
 
 const ID_CHARS = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ID_LENGTH = 10;
+const CLIPBOARD_KEY_PREFIX = "clipboard:";
+const MAX_CLIPBOARD_CHARS = 200_000;
+const RESERVED_CLIPBOARD_SLUGS = new Set([
+  "api",
+  "guest",
+  "clips",
+  "clipboard-api",
+  "favicon.svg",
+  "_preview",
+]);
+
+type ClipboardRecord = {
+  slug: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+  passwordHash?: string | null;
+};
+
+type ClipboardSummary = {
+  slug: string;
+  updatedAt: string;
+  charCount: number;
+  itemCount: number;
+  hasPassword: boolean;
+};
 
 export function generateID(): string {
   let result = "";
@@ -741,6 +768,7 @@ function htmlPage(): string {
             </svg>
           </button>
           <button id="nav-files-btn" type="button" class="btn blue small" data-view="files">Files</button>
+          <button id="nav-clips-btn" type="button" class="btn blue small">Clips</button>
           <button id="nav-guest-btn" type="button" class="btn blue small" data-view="guestLinks">Guest Links</button>
         </nav>
       </div>
@@ -806,6 +834,7 @@ function htmlPage(): string {
           login_help: 'Authentication uses the shared secret configured on the worker.',
           nav_upload: 'Upload',
           nav_files: 'Files',
+          nav_clips: 'Clips',
           nav_guest_links: 'Guest Links',
           system: 'System',
           system_info: 'System Information',
@@ -924,6 +953,7 @@ function htmlPage(): string {
           login_help: '认证使用 Worker 配置的共享密钥。',
           nav_upload: '上传',
           nav_files: '文件',
+          nav_clips: '云便签',
           nav_guest_links: '访客链接',
           system: '系统',
           system_info: '系统信息',
@@ -1070,6 +1100,7 @@ function htmlPage(): string {
         document.getElementById('login-help').textContent = t('login_help');
         document.getElementById('nav-upload-text').textContent = t('nav_upload');
         document.getElementById('nav-files-btn').textContent = t('nav_files');
+        document.getElementById('nav-clips-btn').textContent = t('nav_clips');
         document.getElementById('nav-guest-btn').textContent = t('nav_guest_links');
         systemToggle.textContent = t('system') + ' ▾';
         document.getElementById('menu-system-info').textContent = t('system_info');
@@ -2017,6 +2048,9 @@ function htmlPage(): string {
           render();
         });
       });
+      document.getElementById('nav-clips-btn').addEventListener('click', function() {
+        location.href = '/clips';
+      });
 
       systemToggle.addEventListener('click', function() {
         if (systemMenu.style.display === 'block') closeSystemMenu();
@@ -2093,6 +2127,106 @@ export function escapeHtml(input: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function clipboardKey(slug: string): string {
+  return `${CLIPBOARD_KEY_PREFIX}${slug}`;
+}
+
+export function sanitizeClipboardSlug(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > 64) return null;
+
+  const normalized = trimmed
+    .toLowerCase()
+    .replace(/\s+/g, "-");
+  if (!normalized) return null;
+  if (normalized.startsWith("-") || normalized.endsWith("-")) return null;
+  if (RESERVED_CLIPBOARD_SLUGS.has(normalized)) return null;
+
+  const slugPattern = /^[\p{L}\p{N}_-]+$/u;
+  if (!slugPattern.test(normalized)) return null;
+  return normalized;
+}
+
+export function calculateClipboardStats(content: string): {
+  itemCount: number;
+  lineCount: number;
+  charCount: number;
+} {
+  const text = String(content || "");
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return { itemCount: 0, lineCount: 0, charCount: 0 };
+  }
+  const lines = text.split(/\r?\n/);
+  return {
+    itemCount: lines.filter((line) => line.trim() !== "").length,
+    lineCount: lines.length,
+    charCount: text.length,
+  };
+}
+
+export function normalizeClipboardPassword(input: unknown): string | null {
+  if (typeof input !== "string") return null;
+  const value = input.trim();
+  if (!value) return null;
+  if (value.length > 128) return null;
+  return value;
+}
+
+export async function sha256Hex(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export async function verifyClipboardPassword(hash: string, password: string): Promise<boolean> {
+  return (await sha256Hex(password)) === hash;
+}
+
+export function clipboardPasswordStorageKey(slug: string): string {
+  return `ps_clip_pw_${encodeURIComponent(slug)}`;
+}
+
+async function authorizeClipboardRequest(
+  request: Request,
+  record: ClipboardRecord | null,
+): Promise<{ ok: boolean; normalized: string | null }> {
+  if (!record?.passwordHash) return { ok: true, normalized: null };
+  const provided = normalizeClipboardPassword(request.headers.get("x-clip-password"));
+  if (!provided) return { ok: false, normalized: null };
+  const ok = await verifyClipboardPassword(record.passwordHash, provided);
+  return { ok, normalized: provided };
+}
+
+async function getClipboardRecord(env: Env, slug: string): Promise<ClipboardRecord | null> {
+  return env.CLIPBOARD.get(clipboardKey(slug), "json");
+}
+
+async function listClipboards(env: Env): Promise<ClipboardSummary[]> {
+  const keys = await env.CLIPBOARD.list({ prefix: CLIPBOARD_KEY_PREFIX, limit: 1000 });
+  const records = await Promise.all(
+    keys.keys.map(async (entry) => {
+      const slug = entry.name.slice(CLIPBOARD_KEY_PREFIX.length);
+      const record = await getClipboardRecord(env, slug);
+      if (!record) return null;
+      const stats = calculateClipboardStats(record.content);
+      return {
+        slug: record.slug,
+        updatedAt: record.updatedAt,
+        charCount: stats.charCount,
+        itemCount: stats.itemCount,
+        hasPassword: Boolean(record.passwordHash),
+      } satisfies ClipboardSummary;
+    }),
+  );
+  return records
+    .filter((row): row is ClipboardSummary => Boolean(row))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 async function getGuestLinkById(env: Env, id: string): Promise<GuestLinkRow | null> {
@@ -2583,6 +2717,618 @@ function guestUploadPage(link: GuestLinkRow, message: string | null, isError: bo
 </html>`;
 }
 
+function clipboardListPage(): string {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <title>云便签 - 列表</title>
+  <style>
+    :root {
+      --bg: #eef1f8;
+      --bg-2: #f7f9ff;
+      --text: #26354d;
+      --muted: #6f7d94;
+      --line: rgba(255, 255, 255, 0.68);
+      --line-soft: rgba(145, 158, 185, 0.25);
+      --primary: #328ecf;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "SF Pro Text", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 18% 86%, rgba(68, 95, 255, 0.5), transparent 30%),
+        radial-gradient(circle at 80% 30%, rgba(243, 173, 233, 0.6), transparent 30%),
+        radial-gradient(circle at 55% 50%, rgba(255, 255, 255, 0.7), transparent 42%),
+        linear-gradient(145deg, var(--bg-2), var(--bg));
+      min-height: 100vh;
+      padding: 18px;
+    }
+    .wrap { max-width: 1140px; margin: 0 auto; }
+    .head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 14px;
+      padding: 2px 2px 8px;
+    }
+    h1 { margin: 0; font-size: 44px; letter-spacing: 0.2px; }
+    .new { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    input {
+      border: 1px solid rgba(255, 255, 255, 0.7);
+      border-radius: 12px;
+      padding: 11px 14px;
+      min-width: 280px;
+      font-size: 15px;
+      background: rgba(255, 255, 255, 0.36);
+      color: #40506a;
+      outline: none;
+      backdrop-filter: blur(10px);
+    }
+    input:focus {
+      border-color: rgba(16, 27, 114, 0.42);
+      box-shadow: 0 0 0 3px rgba(16, 27, 114, 0.12);
+    }
+    button {
+      background: transparent;
+      position: relative;
+      padding: 8px 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--primary);
+      border-radius: 12px;
+      overflow: hidden;
+      color: var(--primary);
+      transition: color 0.3s ease, transform 0.2s ease;
+      min-height: 42px;
+    }
+    button:hover { color: #fff; transform: translateY(-1px); }
+    button::before {
+      position: absolute;
+      inset: 0;
+      content: "";
+      border-radius: inherit;
+      background: var(--primary);
+      transform: scaleX(0);
+      transform-origin: left center;
+      transition: transform 0.3s ease-out;
+      z-index: -1;
+    }
+    button:hover::before { transform: scaleX(1); }
+    .card {
+      border: 1px solid rgba(255, 255, 255, 0.5);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.18);
+      backdrop-filter: blur(10px);
+      overflow: hidden;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 15px; background: rgba(255, 255, 255, 0.2); }
+    th, td {
+      padding: 12px 12px;
+      border-bottom: 1px solid var(--line-soft);
+      text-align: left;
+      vertical-align: middle;
+    }
+    th { color: #43536f; font-weight: 700; font-size: 14px; }
+    .muted { color: var(--muted); }
+    a { color: #2b5cc9; text-decoration: none; font-weight: 600; }
+    @media (max-width: 980px) {
+      body { padding: 10px; }
+      h1 { font-size: 34px; }
+      input { min-width: 220px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="head">
+      <h1>云便签列表</h1>
+      <div class="new">
+        <input id="name" type="text" maxlength="64" placeholder="输入名字，例如：zhangsan" />
+        <button id="go" type="button">打开/创建便签</button>
+      </div>
+    </div>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>名称</th>
+            <th>最近更新</th>
+            <th>保护</th>
+            <th>便签项</th>
+            <th>字符</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="6" class="muted">加载中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+  <script>
+    (function() {
+      function formatDate(iso) {
+        if (!iso) return "-";
+        var d = new Date(iso);
+        if (Number.isNaN(d.getTime())) return iso;
+        return d.toLocaleString();
+      }
+      function normalize(value) {
+        return (value || "").trim().toLowerCase().replace(/\\s+/g, "-");
+      }
+      async function loadList() {
+        var rows = document.getElementById("rows");
+        try {
+          var res = await fetch("/clipboard-api/list");
+          if (!res.ok) throw new Error(await res.text());
+          var data = await res.json();
+          if (!data.length) {
+            rows.innerHTML = '<tr><td colspan="6" class="muted">暂无便签，右上角输入名字即可创建。</td></tr>';
+            return;
+          }
+          rows.innerHTML = data.map(function(item) {
+            var name = item.slug;
+            var href = "/" + encodeURIComponent(name);
+            return "<tr>" +
+              "<td><a href=\\"" + href + "\\">" + name + "</a></td>" +
+              "<td>" + formatDate(item.updatedAt) + "</td>" +
+              "<td>" + (item.hasPassword ? "已加密" : "公开") + "</td>" +
+              "<td>" + item.itemCount + "</td>" +
+              "<td>" + item.charCount + "</td>" +
+              "<td><a href=\\"" + href + "\\">进入</a></td>" +
+            "</tr>";
+          }).join("");
+        } catch (err) {
+          rows.innerHTML = '<tr><td colspan="6" class="muted">加载失败：' + String((err && err.message) || err) + '</td></tr>';
+        }
+      }
+
+      var nameInput = document.getElementById("name");
+      function go() {
+        var normalized = normalize(nameInput.value);
+        if (!normalized) return;
+        location.href = "/" + encodeURIComponent(normalized);
+      }
+      document.getElementById("go").addEventListener("click", go);
+      nameInput.addEventListener("keydown", function(evt) {
+        if (evt.key === "Enter") go();
+      });
+      loadList();
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function clipboardDetailPage(slug: string): string {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <title>云便签 - ${escapeHtml(slug)}</title>
+  <style>
+    :root {
+      --bg: #eef1f8;
+      --bg-2: #f7f9ff;
+      --text: #26354d;
+      --muted: #6f7d94;
+      --line: rgba(255, 255, 255, 0.68);
+      --line-soft: rgba(145, 158, 185, 0.25);
+      --primary: #328ecf;
+      --ok: #2ea86f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "SF Pro Text", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 18% 86%, rgba(68, 95, 255, 0.5), transparent 30%),
+        radial-gradient(circle at 80% 30%, rgba(243, 173, 233, 0.6), transparent 30%),
+        radial-gradient(circle at 55% 50%, rgba(255, 255, 255, 0.7), transparent 42%),
+        linear-gradient(145deg, var(--bg-2), var(--bg));
+      min-height: 100vh;
+      padding: 14px;
+    }
+    .top {
+      max-width: 1240px;
+      margin: 0 auto 8px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.32);
+      border-radius: 14px;
+      backdrop-filter: blur(14px);
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .title { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 28px; }
+    .title small { font-size: 14px; color: var(--muted); font-weight: 500; }
+    .action { display: flex; gap: 8px; align-items: center; }
+    button {
+      background: transparent;
+      position: relative;
+      padding: 8px 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--primary);
+      border-radius: 12px;
+      color: var(--primary);
+      overflow: hidden;
+      transition: color 0.3s ease, transform 0.2s ease;
+      min-height: 40px;
+      z-index: 1;
+    }
+    button:hover { color: #fff; transform: translateY(-1px); }
+    button::before {
+      position: absolute;
+      inset: 0;
+      content: "";
+      border-radius: inherit;
+      background: var(--primary);
+      transform: scaleX(0);
+      transform-origin: left center;
+      transition: transform 0.3s ease-out;
+      z-index: -1;
+    }
+    button:hover::before { transform: scaleX(1); }
+    button.secondary { border-color: #8fa2c4; color: #4b5d78; }
+    button.secondary::before { background: #8fa2c4; }
+    .msg { color: var(--ok); font-size: 13px; min-width: 68px; text-align: right; }
+    .grid {
+      max-width: 1240px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 12px;
+      min-height: calc(100vh - 92px);
+    }
+    .editor-wrap {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.32);
+      border-radius: 14px;
+      overflow: hidden;
+      backdrop-filter: blur(14px);
+    }
+    textarea {
+      width: 100%;
+      height: calc(100vh - 110px);
+      border: 0;
+      outline: none;
+      resize: none;
+      padding: 18px;
+      font-size: 16px;
+      line-height: 1.7;
+      color: #283145;
+      background: rgba(255, 255, 255, 0.5);
+    }
+    .side { display: grid; gap: 12px; align-content: start; }
+    .card {
+      background: rgba(255, 255, 255, 0.32);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      backdrop-filter: blur(14px);
+    }
+    .card h3 { margin: 0 0 10px; font-size: 14px; color: #5c6781; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
+    .stats b { display: block; font-size: 22px; color: #2e384c; }
+    .stats span { font-size: 12px; color: var(--muted); }
+    .link-row { display: flex; gap: 8px; }
+    .link-row input,
+    .stack input[type="text"],
+    .stack input[type="password"],
+    .stack select {
+      flex: 1;
+      border: 1px solid rgba(255, 255, 255, 0.7);
+      border-radius: 10px;
+      padding: 9px 10px;
+      font-size: 13px;
+      color: #4f5a72;
+      background: rgba(255, 255, 255, 0.36);
+      outline: none;
+    }
+    .link-row input:focus,
+    .stack input[type="text"]:focus,
+    .stack input[type="password"]:focus,
+    .stack select:focus {
+      border-color: rgba(16, 27, 114, 0.42);
+      box-shadow: 0 0 0 3px rgba(16, 27, 114, 0.12);
+    }
+    .stack { display: grid; gap: 8px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    a { color: #2b5cc9; text-decoration: none; font-weight: 600; }
+    @media (max-width: 960px) {
+      body { padding: 10px; }
+      .top { padding: 12px; }
+      .title { font-size: 22px; }
+      .grid { grid-template-columns: 1fr; min-height: auto; }
+      textarea { height: 55vh; }
+    }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="title">云便签 <small>/${escapeHtml(slug)}</small></div>
+    <div class="action">
+      <button id="copy-link" class="secondary" type="button">复制链接</button>
+      <button id="save" type="button">保存</button>
+      <span id="msg" class="msg"></span>
+    </div>
+  </header>
+  <main class="grid">
+    <section class="editor-wrap">
+      <textarea id="content" placeholder="可以随便记录点什么，支持多设备同步编辑。"></textarea>
+    </section>
+    <aside class="side">
+      <section class="card">
+        <h3>统计信息</h3>
+        <div class="stats">
+          <div><b id="item-count">0</b><span>便签项</span></div>
+          <div><b id="line-count">0</b><span>行数</span></div>
+          <div><b id="char-count">0</b><span>字符</span></div>
+        </div>
+      </section>
+      <section class="card">
+        <h3>分享</h3>
+        <div class="link-row">
+          <input id="url" readonly />
+          <button id="copy-url" class="secondary" type="button">复制</button>
+        </div>
+        <p class="muted">复制此地址后，可在多台设备打开并编辑保存。</p>
+      </section>
+      <section class="card">
+        <h3>密码保护</h3>
+        <div class="stack">
+          <input id="unlock-password" type="password" maxlength="128" placeholder="当前密码（若已加密）" />
+          <div class="link-row">
+            <button id="unlock-btn" class="secondary" type="button">解锁</button>
+            <span id="lock-state" class="muted">状态：未加密</span>
+          </div>
+          <input id="new-password" type="password" maxlength="128" placeholder="新密码（留空为取消密码）" />
+          <button id="set-password-btn" type="button">设置/更新密码</button>
+        </div>
+      </section>
+      <section class="card">
+        <h3>剪贴板列表</h3>
+        <a href="/clips">打开列表页</a>
+      </section>
+    </aside>
+  </main>
+  <script>
+    (function() {
+      var slug = ${JSON.stringify(slug)};
+      var contentEl = document.getElementById("content");
+      var msgEl = document.getElementById("msg");
+      var urlEl = document.getElementById("url");
+      var unlockPasswordEl = document.getElementById("unlock-password");
+      var newPasswordEl = document.getElementById("new-password");
+      var lockStateEl = document.getElementById("lock-state");
+      var passwordStorageKey = ${JSON.stringify(clipboardPasswordStorageKey(slug))};
+      var clipPassword = "";
+      var hasPassword = false;
+      var isDirty = false;
+      var isSaving = false;
+      var lastSavedContent = "";
+      var autoSaveTimer = null;
+      urlEl.value = location.origin + "/" + encodeURIComponent(slug);
+
+      function persistPassword(value) {
+        try {
+          if (value) localStorage.setItem(passwordStorageKey, value);
+          else localStorage.removeItem(passwordStorageKey);
+        } catch {}
+      }
+      try {
+        var remembered = localStorage.getItem(passwordStorageKey) || "";
+        if (remembered) {
+          clipPassword = remembered;
+          unlockPasswordEl.value = remembered;
+        }
+      } catch {}
+
+      function setMsg(text) {
+        msgEl.textContent = text || "";
+        if (!text) return;
+        setTimeout(function() { msgEl.textContent = ""; }, 1600);
+      }
+
+      function setLockState() {
+        lockStateEl.textContent = hasPassword ? "状态：已加密" : "状态：未加密";
+      }
+
+      function authHeaders() {
+        var headers = { "Content-Type": "application/json" };
+        if (clipPassword) headers["x-clip-password"] = clipPassword;
+        return headers;
+      }
+
+      function updateStats() {
+        var text = String(contentEl.value || "");
+        var lines = text ? text.split(/\\r?\\n/) : [];
+        var items = lines.filter(function(line) { return line.trim() !== ""; }).length;
+        document.getElementById("item-count").textContent = String(items);
+        document.getElementById("line-count").textContent = String(lines.length);
+        document.getElementById("char-count").textContent = String(text.length);
+      }
+
+      async function load() {
+        var headers = {};
+        if (clipPassword) headers["x-clip-password"] = clipPassword;
+        var res = await fetch("/clipboard-api/item/" + encodeURIComponent(slug), { headers: headers });
+        if (res.status === 401) {
+          hasPassword = true;
+          if (clipPassword) {
+            clipPassword = "";
+            unlockPasswordEl.value = "";
+            persistPassword("");
+          }
+          setLockState();
+          throw new Error("该便签已加密，请输入密码后解锁");
+        }
+        if (!res.ok) throw new Error(await res.text());
+        var data = await res.json();
+        hasPassword = !!data.hasPassword;
+        if (!hasPassword) persistPassword("");
+        else if (clipPassword) persistPassword(clipPassword);
+        setLockState();
+        contentEl.value = data.content || "";
+        lastSavedContent = contentEl.value;
+        isDirty = false;
+        updateStats();
+      }
+
+      function scheduleAutoSave() {
+        if (autoSaveTimer) clearTimeout(autoSaveTimer);
+        autoSaveTimer = setTimeout(function() {
+          save(true).catch(function() {});
+        }, 900);
+      }
+
+      async function save(silent) {
+        if (isSaving) return;
+        var text = String(contentEl.value || "");
+        if (text.length > ${MAX_CLIPBOARD_CHARS}) {
+          if (!silent) setMsg("内容过长");
+          return;
+        }
+        if (!isDirty && text === lastSavedContent) return;
+        isSaving = true;
+        var res = await fetch("/clipboard-api/item/" + encodeURIComponent(slug), {
+          method: "PUT",
+          headers: authHeaders(),
+          body: JSON.stringify({ content: text }),
+        });
+        if (res.status === 401) {
+          clipPassword = "";
+          unlockPasswordEl.value = "";
+          persistPassword("");
+          isSaving = false;
+          throw new Error("密码错误或未提供密码");
+        }
+        if (!res.ok) {
+          isSaving = false;
+          throw new Error(await res.text());
+        }
+        var data = await res.json();
+        hasPassword = !!data.hasPassword;
+        isSaving = false;
+        isDirty = false;
+        lastSavedContent = text;
+        setLockState();
+        if (!silent) setMsg("已保存");
+      }
+
+      function saveOnMouseLeave() {
+        if (!isDirty) return;
+        save(false).then(function() {
+          setMsg("鼠标移出已自动保存");
+        }).catch(function(err) {
+          setMsg(String((err && err.message) || err));
+        });
+      }
+
+      async function unlock() {
+        clipPassword = String(unlockPasswordEl.value || "").trim();
+        await load();
+        if (clipPassword) persistPassword(clipPassword);
+        setMsg("已解锁");
+      }
+
+      async function updatePassword() {
+        var currentPassword = String(unlockPasswordEl.value || "").trim();
+        var nextPassword = String(newPasswordEl.value || "").trim();
+        var res = await fetch("/clipboard-api/item/" + encodeURIComponent(slug) + "/password", {
+          method: "PUT",
+          headers: authHeaders(),
+          body: JSON.stringify({
+            password: currentPassword || null,
+            newPassword: nextPassword || null,
+          }),
+        });
+        if (res.status === 401) throw new Error("当前密码错误");
+        if (!res.ok) throw new Error(await res.text());
+        var data = await res.json();
+        hasPassword = !!data.hasPassword;
+        if (nextPassword) {
+          clipPassword = nextPassword;
+          unlockPasswordEl.value = nextPassword;
+          persistPassword(nextPassword);
+        } else {
+          clipPassword = "";
+          unlockPasswordEl.value = "";
+          persistPassword("");
+        }
+        newPasswordEl.value = "";
+        setLockState();
+        setMsg(hasPassword ? "密码已更新" : "密码已取消");
+      }
+
+      contentEl.addEventListener("input", function() {
+        isDirty = true;
+        updateStats();
+        scheduleAutoSave();
+      });
+      contentEl.addEventListener("keydown", function(evt) {
+        if (evt.key !== "Enter" || evt.isComposing) return;
+        if (evt.metaKey || evt.ctrlKey || evt.altKey) return;
+        evt.preventDefault();
+        var start = contentEl.selectionStart || 0;
+        var end = contentEl.selectionEnd || 0;
+        var text = contentEl.value || "";
+        contentEl.value = text.slice(0, start) + "\\n" + text.slice(end);
+        contentEl.selectionStart = contentEl.selectionEnd = start + 1;
+        isDirty = true;
+        updateStats();
+        scheduleAutoSave();
+      });
+      document.getElementById("save").addEventListener("click", function() {
+        save(false).catch(function(err) { setMsg(String((err && err.message) || err)); });
+      });
+      document.getElementById("unlock-btn").addEventListener("click", function() {
+        unlock().catch(function(err) { setMsg(String((err && err.message) || err)); });
+      });
+      document.getElementById("set-password-btn").addEventListener("click", function() {
+        updatePassword().catch(function(err) { setMsg(String((err && err.message) || err)); });
+      });
+      document.getElementById("copy-url").addEventListener("click", function() {
+        navigator.clipboard.writeText(urlEl.value).then(function() { setMsg("已复制"); });
+      });
+      document.getElementById("copy-link").addEventListener("click", function() {
+        navigator.clipboard.writeText(urlEl.value).then(function() { setMsg("已复制"); });
+      });
+      document.addEventListener("mouseleave", saveOnMouseLeave);
+      document.addEventListener("visibilitychange", function() {
+        if (document.hidden && isDirty) {
+          save(true).catch(function() {});
+        }
+      });
+
+      setLockState();
+      load().catch(function(err) { setMsg(String((err && err.message) || err)); });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     await ensureSchemaOnce(env);
@@ -2789,6 +3535,110 @@ export default {
       }
 
       return new Response("Method Not Allowed", { status: 405, headers: withCors() });
+    }
+
+    if (url.pathname === "/clipboard-api/list" && request.method === "GET") {
+      const list = await listClipboards(env);
+      return json(list);
+    }
+
+    if (url.pathname.startsWith("/clipboard-api/item/")) {
+      const itemBase = "/clipboard-api/item/";
+      const passwordSuffix = "/password";
+      const isPasswordRoute = url.pathname.endsWith(passwordSuffix);
+      const slugRaw = decodeURIComponent(
+        isPasswordRoute
+          ? url.pathname.slice(itemBase.length, -passwordSuffix.length)
+          : url.pathname.slice(itemBase.length),
+      );
+      const slug = sanitizeClipboardSlug(slugRaw);
+      if (!slug) return json({ error: "invalid clipboard name" }, 400);
+      const existing = await getClipboardRecord(env, slug);
+
+      if (isPasswordRoute) {
+        if (request.method !== "PUT") {
+          return new Response("Method Not Allowed", { status: 405, headers: withCors() });
+        }
+        const body = (await request.json()) as {
+          password?: unknown;
+          newPassword?: unknown;
+        };
+        const newPassword = normalizeClipboardPassword(body.newPassword);
+        const oldPassword = normalizeClipboardPassword(body.password);
+        if (existing?.passwordHash) {
+          if (!oldPassword) return json({ error: "password required" }, 401);
+          if (!(await verifyClipboardPassword(existing.passwordHash, oldPassword))) {
+            return json({ error: "invalid password" }, 401);
+          }
+        }
+        const now = new Date().toISOString();
+        const next: ClipboardRecord = {
+          slug,
+          content: existing?.content || "",
+          createdAt: existing?.createdAt || now,
+          updatedAt: now,
+          passwordHash: newPassword ? await sha256Hex(newPassword) : null,
+        };
+        await env.CLIPBOARD.put(clipboardKey(slug), JSON.stringify(next));
+        return json({ ok: true, hasPassword: Boolean(next.passwordHash), updatedAt: now });
+      }
+
+      if (request.method === "GET") {
+        if (!existing) {
+          return json({
+            slug,
+            content: "",
+            createdAt: null,
+            updatedAt: null,
+            hasPassword: false,
+            ...calculateClipboardStats(""),
+          });
+        }
+        const auth = await authorizeClipboardRequest(request, existing);
+        if (!auth.ok) return json({ error: "password required", hasPassword: true }, 401);
+        return json({
+          slug: existing.slug,
+          content: existing.content,
+          createdAt: existing.createdAt,
+          updatedAt: existing.updatedAt,
+          hasPassword: Boolean(existing.passwordHash),
+          ...calculateClipboardStats(existing.content),
+        });
+      }
+
+      if (request.method === "PUT") {
+        const body = (await request.json()) as { content?: unknown };
+        const content = typeof body.content === "string" ? body.content : "";
+        if (content.length > MAX_CLIPBOARD_CHARS) {
+          return json({ error: `content too large, max ${MAX_CLIPBOARD_CHARS} chars` }, 400);
+        }
+        const auth = await authorizeClipboardRequest(request, existing);
+        if (!auth.ok) return json({ error: "password required", hasPassword: true }, 401);
+        const now = new Date().toISOString();
+        const next: ClipboardRecord = {
+          slug,
+          content,
+          createdAt: existing?.createdAt || now,
+          updatedAt: now,
+          passwordHash: existing?.passwordHash || null,
+        };
+        await env.CLIPBOARD.put(clipboardKey(slug), JSON.stringify(next));
+        return json({
+          ok: true,
+          slug,
+          updatedAt: now,
+          hasPassword: Boolean(next.passwordHash),
+          ...calculateClipboardStats(content),
+        });
+      }
+
+      return new Response("Method Not Allowed", { status: 405, headers: withCors() });
+    }
+
+    if (url.pathname === "/clips" && request.method === "GET") {
+      return new Response(clipboardListPage(), {
+        headers: withCors({ "Content-Type": "text/html; charset=utf-8" }),
+      });
     }
 
     if (url.pathname.startsWith("/api/")) {
@@ -3029,6 +3879,24 @@ export default {
       }
 
       return json({ error: "Not Found" }, 404);
+    }
+
+    if (request.method === "GET") {
+      const rawPath = url.pathname.slice(1);
+      const isSingleSegment = rawPath.length > 0 && !rawPath.includes("/");
+      const notReservedPrefix = !url.pathname.startsWith("/-") && !url.pathname.startsWith("/_preview/");
+      if (isSingleSegment && notReservedPrefix) {
+        const decoded = decodeURIComponent(rawPath);
+        const slug = sanitizeClipboardSlug(decoded);
+        if (slug) {
+          if (decoded !== slug) {
+            return Response.redirect(new URL(`/${encodeURIComponent(slug)}`, url).toString(), 302);
+          }
+          return new Response(clipboardDetailPage(slug), {
+            headers: withCors({ "Content-Type": "text/html; charset=utf-8" }),
+          });
+        }
+      }
     }
 
     return new Response(htmlPage(), {

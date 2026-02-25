@@ -15,3 +15,7 @@ database_id = "00000000-0000-0000-0000-000000000000"
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "picoshare-files"
+
+[[kv_namespaces]]
+binding = "CLIPBOARD"
+id = "00000000000000000000000000000000"
