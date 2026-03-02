@@ -32,6 +32,7 @@ const ID_LENGTH = 10;
 const CLIPBOARD_KEY_PREFIX = "clipboard:";
 const MAX_CLIPBOARD_CHARS = 200_000;
 const MULTIPART_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
+const MULTIPART_UPLOAD_THRESHOLD_BYTES = 100 * 1024 * 1024;
 const RESERVED_CLIPBOARD_SLUGS = new Set([
   "api",
   "guest",
@@ -103,6 +104,10 @@ export function parseMultipartPartNumber(input: string | null): number | null {
   const n = Number.parseInt(input, 10);
   if (!Number.isFinite(n) || n <= 0) return null;
   return n;
+}
+
+export function shouldUseMultipartUpload(sizeBytes: number): boolean {
+  return Number.isFinite(sizeBytes) && sizeBytes >= MULTIPART_UPLOAD_THRESHOLD_BYTES;
 }
 
 export function expirationToISO(days: number | null): string | null {
@@ -864,6 +869,7 @@ function htmlPage(): string {
         downloadsUniqueOnly: false,
         lang: localStorage.getItem('ps_lang') === 'zh' ? 'zh' : 'en',
       };
+      var multipartUploadThresholdBytes = ${MULTIPART_UPLOAD_THRESHOLD_BYTES};
 
       var I18N = {
         en: {
@@ -1409,6 +1415,14 @@ function htmlPage(): string {
         }
       }
 
+      async function directUploadFile(file, noteValue, expirationDays) {
+        var fd = new FormData();
+        fd.append('file', file);
+        fd.append('note', noteValue || '');
+        fd.append('expirationDays', expirationDays);
+        return await api('/api/entry', { method: 'POST', body: fd });
+      }
+
       function el(tag, attrs, children) {
         var node = document.createElement(tag);
         Object.keys(attrs || {}).forEach(function(k) {
@@ -1584,7 +1598,12 @@ function htmlPage(): string {
 
           try {
             if (hasFile) {
-              await multipartUploadFile(hasFile, noteValue, expirationDaysValue);
+              var fileSize = Number(hasFile.size || 0);
+              if (fileSize >= multipartUploadThresholdBytes) {
+                await multipartUploadFile(hasFile, noteValue, expirationDaysValue);
+              } else {
+                await directUploadFile(hasFile, noteValue, expirationDaysValue);
+              }
             } else {
               var fd = new FormData();
               fd.append('pastedText', pastedText);
@@ -3777,6 +3796,9 @@ export default {
         const size = Number(body.size || 0);
         if (!Number.isFinite(size) || size < 0) {
           return json({ error: "invalid file size" }, 400);
+        }
+        if (!shouldUseMultipartUpload(size)) {
+          return json({ error: "file smaller than 100MB should use regular upload" }, 400);
         }
         const note = typeof body.note === "string" ? body.note.trim().slice(0, 1000) || null : null;
         const expirationInput = body.expirationDays == null ? null : String(body.expirationDays);

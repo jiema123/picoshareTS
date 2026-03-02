@@ -10,6 +10,7 @@ import {
   parseMultipartPartNumber,
   parseDateFromUnknown,
   parseExpirationDays,
+  shouldUseMultipartUpload,
   sanitizeClipboardSlug,
   sha256Hex,
   verifyClipboardPassword,
@@ -69,6 +70,18 @@ describe("parseMultipartPartNumber", () => {
     expect(parseMultipartPartNumber("-3")).toBeNull();
     expect(parseMultipartPartNumber("1.5")).toBeNull();
     expect(parseMultipartPartNumber("abc")).toBeNull();
+  });
+});
+
+describe("shouldUseMultipartUpload", () => {
+  it("uses normal upload for files smaller than 100MB", () => {
+    expect(shouldUseMultipartUpload(99 * 1024 * 1024)).toBe(false);
+    expect(shouldUseMultipartUpload(0)).toBe(false);
+  });
+
+  it("uses multipart upload for files at or above 100MB", () => {
+    expect(shouldUseMultipartUpload(100 * 1024 * 1024)).toBe(true);
+    expect(shouldUseMultipartUpload(101 * 1024 * 1024)).toBe(true);
   });
 });
 
