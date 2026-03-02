@@ -7,6 +7,7 @@ import {
   expirationToISO,
   isExpired,
   normalizeClipboardPassword,
+  parseMultipartPartNumber,
   parseDateFromUnknown,
   parseExpirationDays,
   sanitizeClipboardSlug,
@@ -53,6 +54,21 @@ describe("parseDateFromUnknown", () => {
     expect(parseDateFromUnknown("")).toBeNull();
     expect(parseDateFromUnknown(123)).toBeNull();
     expect(parseDateFromUnknown("invalid")).toBeNull();
+  });
+});
+
+describe("parseMultipartPartNumber", () => {
+  it("accepts positive integer part numbers", () => {
+    expect(parseMultipartPartNumber("1")).toBe(1);
+    expect(parseMultipartPartNumber("9999")).toBe(9999);
+  });
+
+  it("rejects invalid part numbers", () => {
+    expect(parseMultipartPartNumber(null)).toBeNull();
+    expect(parseMultipartPartNumber("0")).toBeNull();
+    expect(parseMultipartPartNumber("-3")).toBeNull();
+    expect(parseMultipartPartNumber("1.5")).toBeNull();
+    expect(parseMultipartPartNumber("abc")).toBeNull();
   });
 });
 

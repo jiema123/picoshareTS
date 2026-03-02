@@ -33,3 +33,21 @@ CREATE TABLE IF NOT EXISTS download_events (
   ip TEXT,
   user_agent TEXT
 );
+
+CREATE TABLE IF NOT EXISTS multipart_uploads (
+  upload_id TEXT PRIMARY KEY,
+  entry_id TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  expiration_time TEXT,
+  note TEXT,
+  created_time DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS multipart_upload_parts (
+  upload_id TEXT NOT NULL,
+  part_number INTEGER NOT NULL,
+  etag TEXT NOT NULL,
+  PRIMARY KEY(upload_id, part_number)
+);

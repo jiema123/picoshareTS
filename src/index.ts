@@ -31,6 +31,7 @@ const ID_CHARS = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ID_LENGTH = 10;
 const CLIPBOARD_KEY_PREFIX = "clipboard:";
 const MAX_CLIPBOARD_CHARS = 200_000;
+const MULTIPART_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
 const RESERVED_CLIPBOARD_SLUGS = new Set([
   "api",
   "guest",
@@ -54,6 +55,16 @@ type ClipboardSummary = {
   charCount: number;
   itemCount: number;
   hasPassword: boolean;
+};
+
+type MultipartUploadRow = {
+  upload_id: string;
+  entry_id: string;
+  filename: string;
+  content_type: string;
+  size: number;
+  expiration_time: string | null;
+  note: string | null;
 };
 
 export function generateID(): string {
@@ -86,6 +97,14 @@ export function parseExpirationDays(input: string | null): number | null {
   return Math.min(n, 3650);
 }
 
+export function parseMultipartPartNumber(input: string | null): number | null {
+  if (!input) return null;
+  if (!/^\d+$/.test(input)) return null;
+  const n = Number.parseInt(input, 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
 export function expirationToISO(days: number | null): string | null {
   if (!days) return null;
   const d = new Date();
@@ -112,6 +131,28 @@ async function ensureSchema(env: Env): Promise<void> {
       downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       ip TEXT,
       user_agent TEXT
+    )`,
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS multipart_uploads (
+      upload_id TEXT PRIMARY KEY,
+      entry_id TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      content_type TEXT NOT NULL,
+      size INTEGER NOT NULL DEFAULT 0,
+      expiration_time TEXT,
+      note TEXT,
+      created_time DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS multipart_upload_parts (
+      upload_id TEXT NOT NULL,
+      part_number INTEGER NOT NULL,
+      etag TEXT NOT NULL,
+      PRIMARY KEY(upload_id, part_number)
     )`,
   ).run();
 
@@ -1310,6 +1351,64 @@ function htmlPage(): string {
         return res.text();
       }
 
+      async function multipartUploadFile(file, noteValue, expirationDays) {
+        var init = await api('/api/entry/multipart/init', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename: file.name || 'upload.bin',
+            contentType: file.type || 'application/octet-stream',
+            size: Number(file.size || 0),
+            note: noteValue || '',
+            expirationDays: expirationDays,
+          }),
+        });
+        var uploadId = init && init.uploadId ? String(init.uploadId) : '';
+        var chunkSize = Number(init && init.chunkSize ? init.chunkSize : 0) || (8 * 1024 * 1024);
+        if (!uploadId) throw new Error('multipart init failed');
+
+        var total = Number(file.size || 0);
+        var partCount = Math.max(1, Math.ceil(total / chunkSize));
+        try {
+          for (var i = 0; i < partCount; i += 1) {
+            var start = i * chunkSize;
+            var end = Math.min(total, start + chunkSize);
+            var chunk = file.slice(start, end);
+            var partNumber = i + 1;
+            setBusy(true, t('uploading_wait') + ' ' + partNumber + '/' + partCount);
+            var res = await fetch('/api/entry/multipart/part/' + encodeURIComponent(uploadId) + '/' + String(partNumber), {
+              method: 'PUT',
+              headers: authHeaders({ 'Content-Type': 'application/octet-stream' }),
+              body: chunk,
+            });
+            if (res.status === 401) {
+              logout();
+              throw new Error('Unauthorized');
+            }
+            if (!res.ok) {
+              var errText = await res.text();
+              throw new Error(errText || ('Chunk upload failed: ' + res.status));
+            }
+          }
+          return await api('/api/entry/multipart/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ uploadId: uploadId }),
+          });
+        } catch (err) {
+          try {
+            await api('/api/entry/multipart/abort', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ uploadId: uploadId }),
+            });
+          } catch (_) {
+            // Ignore abort errors and bubble up the original upload error.
+          }
+          throw err;
+        }
+      }
+
       function el(tag, attrs, children) {
         var node = document.createElement(tag);
         Object.keys(attrs || {}).forEach(function(k) {
@@ -1480,14 +1579,19 @@ function htmlPage(): string {
 
           isUploading = true;
           setBusy(true, t('uploading_wait'));
-          var fd = new FormData();
-          if (hasFile) fd.append('file', hasFile);
-          if (pastedText) fd.append('pastedText', pastedText);
-          fd.append('note', note.value.trim());
-          fd.append('expirationDays', expSelect.value);
+          var noteValue = note.value.trim();
+          var expirationDaysValue = expSelect.value;
 
           try {
-            await api('/api/entry', { method: 'POST', body: fd });
+            if (hasFile) {
+              await multipartUploadFile(hasFile, noteValue, expirationDaysValue);
+            } else {
+              var fd = new FormData();
+              fd.append('pastedText', pastedText);
+              fd.append('note', noteValue);
+              fd.append('expirationDays', expirationDaysValue);
+              await api('/api/entry', { method: 'POST', body: fd });
+            }
             setFlash(t('upload_success'), false);
             setSelectedFile(null);
             fileInput.value = '';
@@ -2104,6 +2208,16 @@ async function getEntryById(env: Env, id: string): Promise<EntryRow | null> {
   )
     .bind(id)
     .first<EntryRow>();
+}
+
+async function getMultipartUploadById(env: Env, uploadId: string): Promise<MultipartUploadRow | null> {
+  return env.DB.prepare(
+    `SELECT upload_id, entry_id, filename, content_type, size, expiration_time, note
+     FROM multipart_uploads
+     WHERE upload_id = ?`,
+  )
+    .bind(uploadId)
+    .first<MultipartUploadRow>();
 }
 
 export function isExpired(iso: string | null): boolean {
@@ -3644,6 +3758,117 @@ export default {
     if (url.pathname.startsWith("/api/")) {
       if (!(await requireAuth(request, env))) {
         return unauthorized();
+      }
+
+      if (url.pathname === "/api/entry/multipart/init" && request.method === "POST") {
+        const body = (await request.json()) as {
+          filename?: unknown;
+          contentType?: unknown;
+          size?: unknown;
+          note?: unknown;
+          expirationDays?: unknown;
+        };
+        const filename = typeof body.filename === "string" && body.filename.trim()
+          ? body.filename.trim().slice(0, 255)
+          : `upload-${generateID()}.bin`;
+        const contentType = typeof body.contentType === "string" && body.contentType.trim()
+          ? body.contentType.trim()
+          : "application/octet-stream";
+        const size = Number(body.size || 0);
+        if (!Number.isFinite(size) || size < 0) {
+          return json({ error: "invalid file size" }, 400);
+        }
+        const note = typeof body.note === "string" ? body.note.trim().slice(0, 1000) || null : null;
+        const expirationInput = body.expirationDays == null ? null : String(body.expirationDays);
+        const expiration = expirationToISO(parseExpirationDays(expirationInput));
+        const entryId = generateID();
+        const upload = await env.BUCKET.createMultipartUpload(entryId, { httpMetadata: { contentType } });
+        await env.DB.prepare(
+          `INSERT INTO multipart_uploads
+            (upload_id, entry_id, filename, content_type, size, expiration_time, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+          .bind(upload.uploadId, entryId, filename, contentType, Math.floor(size), expiration, note)
+          .run();
+        return json({
+          uploadId: upload.uploadId,
+          id: entryId,
+          chunkSize: MULTIPART_CHUNK_SIZE_BYTES,
+        });
+      }
+
+      if (url.pathname.startsWith("/api/entry/multipart/part/") && request.method === "PUT") {
+        const seg = url.pathname.split("/");
+        const uploadId = decodeURIComponent(seg[5] || "");
+        const partNumber = parseMultipartPartNumber(seg[6] || null);
+        if (!uploadId || !partNumber) return json({ error: "invalid upload id or part number" }, 400);
+        const upload = await getMultipartUploadById(env, uploadId);
+        if (!upload) return json({ error: "multipart upload not found" }, 404);
+
+        const bytes = await request.arrayBuffer();
+        const multipart = env.BUCKET.resumeMultipartUpload(upload.entry_id, upload.upload_id);
+        const part = await multipart.uploadPart(partNumber, bytes);
+        await env.DB.prepare(
+          `INSERT OR REPLACE INTO multipart_upload_parts (upload_id, part_number, etag)
+           VALUES (?, ?, ?)`,
+        )
+          .bind(uploadId, part.partNumber, part.etag)
+          .run();
+        return json({ ok: true, partNumber: part.partNumber });
+      }
+
+      if (url.pathname === "/api/entry/multipart/complete" && request.method === "POST") {
+        const body = (await request.json()) as { uploadId?: unknown };
+        const uploadId = typeof body.uploadId === "string" ? body.uploadId : "";
+        if (!uploadId) return json({ error: "uploadId is required" }, 400);
+        const upload = await getMultipartUploadById(env, uploadId);
+        if (!upload) return json({ error: "multipart upload not found" }, 404);
+        const parts = await env.DB.prepare(
+          `SELECT part_number AS partNumber, etag
+           FROM multipart_upload_parts
+           WHERE upload_id = ?
+           ORDER BY part_number ASC`,
+        )
+          .bind(uploadId)
+          .all<{ partNumber: number; etag: string }>();
+        if (!parts.results.length) {
+          return json({ error: "no uploaded parts found" }, 400);
+        }
+
+        const multipart = env.BUCKET.resumeMultipartUpload(upload.entry_id, upload.upload_id);
+        await multipart.complete(parts.results);
+        await env.DB.prepare(
+          "INSERT INTO entries (id, filename, content_type, size, expiration_time, note) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+          .bind(
+            upload.entry_id,
+            upload.filename,
+            upload.content_type || "application/octet-stream",
+            upload.size || 0,
+            upload.expiration_time,
+            upload.note,
+          )
+          .run();
+        await env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id = ?").bind(uploadId).run();
+        await env.DB.prepare("DELETE FROM multipart_uploads WHERE upload_id = ?").bind(uploadId).run();
+        return json({ id: upload.entry_id, filename: upload.filename });
+      }
+
+      if (url.pathname === "/api/entry/multipart/abort" && request.method === "POST") {
+        const body = (await request.json()) as { uploadId?: unknown };
+        const uploadId = typeof body.uploadId === "string" ? body.uploadId : "";
+        if (!uploadId) return json({ error: "uploadId is required" }, 400);
+        const upload = await getMultipartUploadById(env, uploadId);
+        if (upload) {
+          try {
+            await env.BUCKET.resumeMultipartUpload(upload.entry_id, upload.upload_id).abort();
+          } catch {
+            // Ignore abort failures so local metadata can still be cleaned.
+          }
+          await env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id = ?").bind(uploadId).run();
+          await env.DB.prepare("DELETE FROM multipart_uploads WHERE upload_id = ?").bind(uploadId).run();
+        }
+        return json({ ok: true });
       }
 
       if (url.pathname === "/api/entry" && request.method === "POST") {
