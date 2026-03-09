@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_CLIPBOARD_CHARS,
   calculateClipboardStats,
   clipboardPasswordStorageKey,
   cleanupExpiredEntries,
@@ -177,6 +178,10 @@ describe("sanitizeClipboardSlug", () => {
 });
 
 describe("calculateClipboardStats", () => {
+  it("uses the expanded clipboard content limit", () => {
+    expect(MAX_CLIPBOARD_CHARS).toBe(1_000_000);
+  });
+
   it("returns stats for empty content", () => {
     expect(calculateClipboardStats("")).toEqual({ itemCount: 0, lineCount: 0, charCount: 0 });
     expect(calculateClipboardStats("   ")).toEqual({ itemCount: 0, lineCount: 0, charCount: 0 });
