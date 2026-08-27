@@ -7,6 +7,7 @@ import {
   escapeHtml,
   expirationToISO,
   isExpired,
+  md5Hex,
   normalizeClipboardPassword,
   parseMultipartPartNumber,
   parseDateFromUnknown,
@@ -90,6 +91,19 @@ describe("escapeHtml", () => {
   it("escapes dangerous html characters", () => {
     expect(escapeHtml("<script>alert('x')</script>"))
       .toBe("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;");
+  });
+});
+
+describe("md5Hex", () => {
+  it("matches standard MD5 test vectors", () => {
+    expect(md5Hex(new TextEncoder().encode(""))).toBe("d41d8cd98f00b204e9800998ecf8427e");
+    expect(md5Hex(new TextEncoder().encode("The quick brown fox jumps over the lazy dog")))
+      .toBe("9e107d9d372bb6826bd81d3542a419d6");
+  });
+
+  it("handles input that crosses multiple 64-byte blocks", () => {
+    expect(md5Hex(new TextEncoder().encode("a".repeat(1000))))
+      .toBe("cabe45dcc9ae5b66ba86600cca6b8ba8");
   });
 });
 

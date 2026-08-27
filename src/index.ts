@@ -10,10 +10,25 @@ type EntryRow = {
   filename: string;
   content_type: string | null;
   size: number;
+  md5: string | null;
+  version: number;
+  current_object_key: string | null;
   upload_time: string;
+  updated_time: string | null;
   expiration_time: string | null;
   note: string | null;
   guest_link_id: string | null;
+};
+
+type FileVersionRow = {
+  entry_id: string;
+  version: number;
+  filename: string;
+  content_type: string | null;
+  size: number;
+  md5: string | null;
+  created_time: string;
+  object_key: string;
 };
 
 type GuestLinkRow = {
@@ -66,7 +81,146 @@ type MultipartUploadRow = {
   size: number;
   expiration_time: string | null;
   note: string | null;
+  is_update: number;
+  expected_version: number | null;
+  object_key: string | null;
 };
+
+const MD5_SHIFT_AMOUNTS = [
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+];
+
+const MD5_CONSTANTS = Array.from({ length: 64 }, (_, i) =>
+  Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0,
+);
+
+function md5LeftRotate(value: number, amount: number): number {
+  return ((value << amount) | (value >>> (32 - amount))) >>> 0;
+}
+
+class Md5Hasher {
+  private a = 0x67452301;
+  private b = 0xefcdab89;
+  private c = 0x98badcfe;
+  private d = 0x10325476;
+  private totalBytes = 0;
+  private pending = new Uint8Array(64);
+  private pendingLength = 0;
+
+  update(input: Uint8Array): this {
+    this.totalBytes += input.byteLength;
+    let offset = 0;
+
+    if (this.pendingLength > 0) {
+      const needed = 64 - this.pendingLength;
+      const copied = Math.min(needed, input.byteLength);
+      this.pending.set(input.subarray(0, copied), this.pendingLength);
+      this.pendingLength += copied;
+      offset += copied;
+      if (this.pendingLength === 64) {
+        this.processBlock(this.pending);
+        this.pendingLength = 0;
+      }
+    }
+
+    while (offset + 64 <= input.byteLength) {
+      this.processBlock(input.subarray(offset, offset + 64));
+      offset += 64;
+    }
+
+    if (offset < input.byteLength) {
+      this.pending.set(input.subarray(offset), 0);
+      this.pendingLength = input.byteLength - offset;
+    }
+    return this;
+  }
+
+  digest(): string {
+    const tailLength = this.pendingLength;
+    const paddedLength = tailLength < 56 ? 64 : 128;
+    const finalBlock = new Uint8Array(paddedLength);
+    finalBlock.set(this.pending.subarray(0, tailLength));
+    finalBlock[tailLength] = 0x80;
+
+    const bitLength = this.totalBytes * 8;
+    for (let i = 0; i < 8; i += 1) {
+      finalBlock[paddedLength - 8 + i] = Math.floor(bitLength / 2 ** (8 * i)) & 0xff;
+    }
+
+    this.processBlock(finalBlock.subarray(0, 64));
+    if (paddedLength === 128) this.processBlock(finalBlock.subarray(64, 128));
+
+    return [this.a, this.b, this.c, this.d]
+      .map((word) => Array.from({ length: 4 }, (_, i) => ((word >>> (8 * i)) & 0xff).toString(16).padStart(2, "0")).join(""))
+      .join("");
+  }
+
+  private processBlock(block: Uint8Array): void {
+    const words = new Uint32Array(16);
+    for (let i = 0; i < 16; i += 1) {
+      const offset = i * 4;
+      words[i] = (
+        block[offset] |
+        (block[offset + 1] << 8) |
+        (block[offset + 2] << 16) |
+        (block[offset + 3] << 24)
+      ) >>> 0;
+    }
+
+    let a = this.a;
+    let b = this.b;
+    let c = this.c;
+    let d = this.d;
+
+    for (let i = 0; i < 64; i += 1) {
+      let f: number;
+      let g: number;
+      if (i < 16) {
+        f = (b & c) | (~b & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | (~d & c);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        g = (7 * i) % 16;
+      }
+
+      const next = (a + f + MD5_CONSTANTS[i] + words[g]) >>> 0;
+      a = d;
+      d = c;
+      c = b;
+      b = (b + md5LeftRotate(next, MD5_SHIFT_AMOUNTS[i])) >>> 0;
+    }
+
+    this.a = (this.a + a) >>> 0;
+    this.b = (this.b + b) >>> 0;
+    this.c = (this.c + c) >>> 0;
+    this.d = (this.d + d) >>> 0;
+  }
+}
+
+export function md5Hex(input: ArrayBuffer | Uint8Array): string {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  return new Md5Hasher().update(bytes).digest();
+}
+
+async function md5HexFromStream(body: ReadableStream<Uint8Array>): Promise<string> {
+  const hasher = new Md5Hasher();
+  const reader = body.getReader();
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    hasher.update(chunk.value);
+  }
+  return hasher.digest();
+}
 
 export function generateID(): string {
   let result = "";
@@ -161,10 +315,31 @@ async function ensureSchema(env: Env): Promise<void> {
     )`,
   ).run();
 
+  await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS file_versions (
+      entry_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      filename TEXT NOT NULL,
+      content_type TEXT,
+      size INTEGER NOT NULL,
+      md5 TEXT,
+      created_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      object_key TEXT NOT NULL,
+      PRIMARY KEY(entry_id, version)
+    )`,
+  ).run();
+
   const alterStatements = [
+    "ALTER TABLE entries ADD COLUMN md5 TEXT",
+    "ALTER TABLE entries ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE entries ADD COLUMN current_object_key TEXT",
+    "ALTER TABLE entries ADD COLUMN updated_time DATETIME",
     "ALTER TABLE guest_links ADD COLUMN label TEXT",
     "ALTER TABLE guest_links ADD COLUMN created_time DATETIME DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE guest_links ADD COLUMN upload_count INTEGER DEFAULT 0",
+    "ALTER TABLE multipart_uploads ADD COLUMN is_update INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE multipart_uploads ADD COLUMN expected_version INTEGER",
+    "ALTER TABLE multipart_uploads ADD COLUMN object_key TEXT",
   ];
 
   for (const stmt of alterStatements) {
@@ -937,9 +1112,22 @@ function htmlPage(): string {
           full_link_copied: 'Full link copied.',
           short_link_copied: 'Short link copied.',
           edit_file_title: 'Edit File',
+          update_file: 'Update file',
+          update_file_title: 'Update File Content',
+          update_same_name_hint: 'Choose a replacement file with the same filename. The existing link will stay unchanged.',
+          choose_update_file: 'Choose replacement file',
+          same_name_required: 'The replacement file must keep the same filename.',
           delete_after_expiration: 'Delete after expiration',
           save: 'Save',
           file_updated: 'File updated.',
+          current_version: 'Current version',
+          file_md5: 'MD5',
+          last_updated: 'Last updated',
+          versions: 'File versions',
+          version_number: 'Version',
+          version_time: 'Updated at',
+          download_version: 'Download',
+          no_versions: 'No version history yet',
           guest_links: 'Guest Links',
           guest_desc_1: 'Guest links allow other users to upload files to this PicoShare server without signing in.',
           guest_desc_2: 'Share a guest link if you want an easy way for someone to share a file with you.',
@@ -1056,9 +1244,22 @@ function htmlPage(): string {
           full_link_copied: '完整链接已复制。',
           short_link_copied: '短链接已复制。',
           edit_file_title: '编辑文件',
+          update_file: '更新文件',
+          update_file_title: '更新文件内容',
+          update_same_name_hint: '请选择同名替换文件，原有链接地址保持不变。',
+          choose_update_file: '选择替换文件',
+          same_name_required: '替换文件必须保持相同文件名。',
           delete_after_expiration: '到期后自动删除',
           save: '保存',
           file_updated: '文件已更新。',
+          current_version: '当前版本',
+          file_md5: 'MD5',
+          last_updated: '最后更新',
+          versions: '文件版本',
+          version_number: '版本',
+          version_time: '更新时间',
+          download_version: '下载',
+          no_versions: '暂无版本记录',
           guest_links: '访客链接',
           guest_desc_1: '访客链接允许他人在不登录的情况下上传文件到当前 PicoShare 服务。',
           guest_desc_2: '你可以分享访客链接，让他人更方便地向你发送文件。',
@@ -1357,17 +1558,22 @@ function htmlPage(): string {
         return res.text();
       }
 
-      async function multipartUploadFile(file, noteValue, expirationDays) {
+      async function multipartUploadFile(file, noteValue, expirationDays, updateEntryId, updateVersion) {
+        var initPayload = {
+          filename: file.name || 'upload.bin',
+          contentType: file.type || 'application/octet-stream',
+          size: Number(file.size || 0),
+          note: noteValue || '',
+          expirationDays: expirationDays,
+        };
+        if (updateEntryId) {
+          initPayload.entryId = updateEntryId;
+          initPayload.version = Number(updateVersion || 1);
+        }
         var init = await api('/api/entry/multipart/init', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            filename: file.name || 'upload.bin',
-            contentType: file.type || 'application/octet-stream',
-            size: Number(file.size || 0),
-            note: noteValue || '',
-            expirationDays: expirationDays,
-          }),
+          body: JSON.stringify(initPayload),
         });
         var uploadId = init && init.uploadId ? String(init.uploadId) : '';
         var chunkSize = Number(init && init.chunkSize ? init.chunkSize : 0) || (8 * 1024 * 1024);
@@ -1413,6 +1619,36 @@ function htmlPage(): string {
           }
           throw err;
         }
+      }
+
+      async function updateFileContent(id, file, version) {
+        var fd = new FormData();
+        fd.append('file', file);
+        fd.append('version', String(version || 1));
+        return await api('/api/entry/' + encodeURIComponent(id) + '/content', {
+          method: 'PUT',
+          body: fd,
+        });
+      }
+
+      async function downloadFileVersion(id, version, filename) {
+        var res = await fetch('/api/entry/' + encodeURIComponent(id) + '/versions/' + String(version) + '/content', {
+          headers: authHeaders(),
+        });
+        if (res.status === 401) {
+          logout();
+          throw new Error('Unauthorized');
+        }
+        if (!res.ok) throw new Error((await res.text()) || ('Request failed: ' + res.status));
+        var blob = await res.blob();
+        var objectUrl = URL.createObjectURL(blob);
+        var link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = filename || 'download';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(function() { URL.revokeObjectURL(objectUrl); }, 1000);
       }
 
       async function directUploadFile(file, noteValue, expirationDays) {
@@ -1738,6 +1974,8 @@ function htmlPage(): string {
       async function createFileInfoView() {
         var id = state.selectedId;
         var data = await api('/api/entry/' + encodeURIComponent(id));
+        var versionsData = await api('/api/entry/' + encodeURIComponent(id) + '/versions');
+        var versions = versionsData.versions || [];
         var root = el('section', { class: 'stack' });
         root.appendChild(el('h1', { text: t('file_information') }));
         function kv(label, value) {
@@ -1770,6 +2008,9 @@ function htmlPage(): string {
         var info = el('div', { class: 'stack' });
         info.appendChild(kv(t('filename'), data.filename));
         info.appendChild(kv(t('size'), formatSize(data.size)));
+        info.appendChild(kv(t('current_version'), String(data.version || 1)));
+        info.appendChild(kv(t('file_md5'), data.md5 || t('not_available')));
+        info.appendChild(kv(t('last_updated'), formatDateTime(data.updated_time)));
         info.appendChild(kv(t('expires'), formatDate(data.expiration_time)));
         var downloadsWrap = el('div');
         downloadsWrap.appendChild(el('strong', { text: t('downloads') }));
@@ -1794,7 +2035,65 @@ function htmlPage(): string {
         info.appendChild(kv(t('uploaded_by'), t('you')));
         root.appendChild(info);
 
+        var versionsPanel = el('div', { class: 'panel stack' });
+        versionsPanel.appendChild(el('h3', { text: t('versions') }));
+        if (versions.length === 0) {
+          versionsPanel.appendChild(el('div', { class: 'muted', text: t('no_versions') }));
+        } else {
+          var versionsWrap = el('div', { class: 'table-wrap' });
+          var versionsTable = el('table', { class: 'files-table' });
+          var versionsHead = el('tr');
+          [t('version_number'), t('size'), t('file_md5'), t('version_time'), t('actions')].forEach(function(title) {
+            versionsHead.appendChild(el('th', { scope: 'col', text: title }));
+          });
+          versionsTable.appendChild(el('thead', {}, [versionsHead]));
+          var versionsBody = el('tbody');
+          versions.forEach(function(version) {
+            var row = el('tr');
+            row.appendChild(el('td', { text: String(version.version) }));
+            row.appendChild(el('td', { text: formatSize(version.size) }));
+            row.appendChild(el('td', { text: version.md5 || t('not_available') }));
+            row.appendChild(el('td', { text: formatDateTime(version.created_time) }));
+            row.appendChild(el('td', { class: 'actions' }, [
+              el('button', {
+                type: 'button',
+                class: 'btn blue small',
+                text: t('download_version'),
+                onclick: async function() {
+                  try {
+                    setBusy(true, t('download_version'));
+                    await downloadFileVersion(data.id, version.version, version.filename);
+                  } catch (err) {
+                    setFlash(String(err.message || err), true);
+                  } finally {
+                    setBusy(false);
+                  }
+                },
+              }),
+            ]));
+            versionsBody.appendChild(row);
+          });
+          versionsTable.appendChild(versionsBody);
+          versionsWrap.appendChild(versionsTable);
+          versionsPanel.appendChild(versionsWrap);
+        }
+        root.appendChild(versionsPanel);
+
         root.appendChild(el('div', { class: 'submit-row' }, [
+          el('button', {
+            type: 'button', class: 'btn blue form-submit tight', text: t('update_file'), onclick: function() {
+              state.selectedId = data.id;
+              state.view = 'fileUpdate';
+              render();
+            }
+          }),
+          el('button', {
+            type: 'button', class: 'btn secondary form-submit tight', text: t('edit_file'), onclick: function() {
+              state.selectedId = data.id;
+              state.view = 'fileEdit';
+              render();
+            }
+          }),
           el('button', {
             type: 'button', class: 'btn form-submit tight', text: t('back_to_files'), onclick: function() {
               state.view = 'files';
@@ -1803,6 +2102,82 @@ function htmlPage(): string {
           }),
         ]));
 
+        return root;
+      }
+
+      async function createFileUpdateView() {
+        var id = state.selectedId;
+        var data = await api('/api/entry/' + encodeURIComponent(id));
+        var root = el('section', { class: 'stack' });
+        root.appendChild(el('h1', { text: t('update_file_title') }));
+        root.appendChild(el('div', { class: 'note-box', text: t('update_same_name_hint') }));
+
+        var form = el('form', { class: 'upload-grid' });
+        var fileInput = el('input', { id: 'update-file', type: 'file', class: 'hidden' });
+        var selectedLabel = el('div', { class: 'drop-file', text: t('no_file_selected') });
+        var drop = el('button', { type: 'button', class: 'drop', onclick: function() { fileInput.click(); } }, [
+          el('div', { class: 'drop-primary', text: t('choose_update_file') }),
+          el('div', { class: 'drop-secondary', text: data.filename }),
+          selectedLabel,
+        ]);
+        var selectedFile = null;
+        var submit = el('button', { type: 'submit', class: 'btn form-submit', text: t('update_file') });
+
+        function syncSelection(file) {
+          selectedFile = file || null;
+          if (!selectedFile) {
+            selectedLabel.textContent = t('no_file_selected');
+            submit.disabled = true;
+            return;
+          }
+          selectedLabel.textContent = selectedFile.name;
+          submit.disabled = selectedFile.name !== data.filename;
+        }
+
+        fileInput.addEventListener('change', function() {
+          syncSelection(fileInput.files && fileInput.files[0] ? fileInput.files[0] : null);
+        });
+        syncSelection(null);
+        form.appendChild(drop);
+        form.appendChild(fileInput);
+        form.appendChild(el('div', { class: 'small', text: t('same_name_required') }));
+        form.appendChild(el('div', { class: 'submit-row' }, [submit]));
+        form.addEventListener('submit', async function(evt) {
+          evt.preventDefault();
+          if (!selectedFile) {
+            setFlash(t('select_or_paste_first'), true);
+            return;
+          }
+          if (selectedFile.name !== data.filename) {
+            setFlash(t('same_name_required'), true);
+            return;
+          }
+          try {
+            setBusy(true, t('uploading_wait'));
+            if (Number(selectedFile.size || 0) >= multipartUploadThresholdBytes) {
+              await multipartUploadFile(selectedFile, '', null, id, data.version);
+            } else {
+              await updateFileContent(id, selectedFile, data.version);
+            }
+            await refreshFiles();
+            setFlash(t('file_updated'), false);
+            state.view = 'fileInfo';
+            await render();
+          } catch (err) {
+            setFlash(String(err.message || err), true);
+          } finally {
+            setBusy(false);
+          }
+        });
+        root.appendChild(form);
+        root.appendChild(el('div', { class: 'submit-row' }, [
+          el('button', {
+            type: 'button', class: 'btn form-submit tight', text: t('cancel'), onclick: function() {
+              state.view = 'fileInfo';
+              render();
+            }
+          }),
+        ]));
         return root;
       }
 
@@ -2155,6 +2530,7 @@ function htmlPage(): string {
           else if (state.view === 'systemInfo') mainEl.appendChild(await createSystemInfoView());
           else if (state.view === 'settings') mainEl.appendChild(createSettingsView());
           else if (state.view === 'fileInfo') mainEl.appendChild(await createFileInfoView());
+          else if (state.view === 'fileUpdate') mainEl.appendChild(await createFileUpdateView());
           else if (state.view === 'downloads') mainEl.appendChild(await createDownloadsView());
           else if (state.view === 'fileEdit') mainEl.appendChild(await createFileEditView());
           mainEl.focus();
@@ -2223,7 +2599,12 @@ function htmlPage(): string {
 
 async function getEntryById(env: Env, id: string): Promise<EntryRow | null> {
   return env.DB.prepare(
-    "SELECT id, filename, content_type, size, upload_time, expiration_time, note, guest_link_id FROM entries WHERE id = ?",
+    `SELECT id, filename, content_type, size, md5,
+            COALESCE(version, 1) AS version, current_object_key,
+            upload_time, COALESCE(updated_time, upload_time) AS updated_time,
+            expiration_time, note, guest_link_id
+     FROM entries
+     WHERE id = ?`,
   )
     .bind(id)
     .first<EntryRow>();
@@ -2231,12 +2612,187 @@ async function getEntryById(env: Env, id: string): Promise<EntryRow | null> {
 
 async function getMultipartUploadById(env: Env, uploadId: string): Promise<MultipartUploadRow | null> {
   return env.DB.prepare(
-    `SELECT upload_id, entry_id, filename, content_type, size, expiration_time, note
+    `SELECT upload_id, entry_id, filename, content_type, size, expiration_time, note,
+            is_update, expected_version, object_key
      FROM multipart_uploads
      WHERE upload_id = ?`,
   )
     .bind(uploadId)
     .first<MultipartUploadRow>();
+}
+
+function fileVersionObjectKey(entryId: string, version: number): string {
+  return `${entryId}/versions/${version}`;
+}
+
+function newFileVersionObjectKey(entryId: string, version: number): string {
+  return `${fileVersionObjectKey(entryId, version)}-${generateID()}`;
+}
+
+function currentObjectKey(entry: Pick<EntryRow, "id" | "current_object_key">): string {
+  return entry.current_object_key || entry.id;
+}
+
+async function getFileVersion(
+  env: Env,
+  entryId: string,
+  version: number,
+): Promise<FileVersionRow | null> {
+  return env.DB.prepare(
+    `SELECT entry_id, version, filename, content_type, size, md5, created_time, object_key
+     FROM file_versions
+     WHERE entry_id = ? AND version = ?`,
+  )
+    .bind(entryId, version)
+    .first<FileVersionRow>();
+}
+
+async function snapshotCurrentFileVersion(env: Env, entry: EntryRow): Promise<FileVersionRow> {
+  const currentVersion = Math.max(1, Number(entry.version || 1));
+  const currentKey = currentObjectKey(entry);
+  const historyKey = fileVersionObjectKey(entry.id, currentVersion);
+  const existing = await getFileVersion(env, entry.id, currentVersion);
+  if (currentKey === historyKey && existing) return existing;
+
+  const object = await env.BUCKET.get(currentKey);
+  if (!object || !object.body) throw new Error("current file content not found");
+
+  const [copyBody, hashBody] = object.body.tee();
+  const [, md5] = await Promise.all([
+    env.BUCKET.put(historyKey, copyBody, { httpMetadata: { contentType: entry.content_type || "application/octet-stream" } }),
+    md5HexFromStream(hashBody),
+  ]);
+
+  if (existing) {
+    await env.DB.prepare(
+      `UPDATE file_versions
+       SET filename = ?, content_type = ?, size = ?, md5 = ?, object_key = ?
+       WHERE entry_id = ? AND version = ?`,
+    )
+      .bind(
+        entry.filename,
+        entry.content_type,
+        entry.size,
+        md5,
+        historyKey,
+        entry.id,
+        currentVersion,
+      )
+      .run();
+    return { ...existing, filename: entry.filename, content_type: entry.content_type, size: entry.size, md5, object_key: historyKey };
+  }
+
+  const record = {
+    entry_id: entry.id,
+    version: currentVersion,
+    filename: entry.filename,
+    content_type: entry.content_type,
+    size: entry.size,
+    md5: md5,
+    created_time: entry.upload_time,
+    object_key: historyKey,
+  };
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO file_versions
+      (entry_id, version, filename, content_type, size, md5, created_time, object_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(record.entry_id, record.version, record.filename, record.content_type, record.size, record.md5, record.created_time, record.object_key)
+    .run();
+  return record;
+}
+
+async function recordNewFileVersion(
+  env: Env,
+  entry: Pick<EntryRow, "id" | "filename" | "content_type" | "size">,
+  version: number,
+  md5: string,
+  objectKey = entry.id,
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO file_versions
+      (entry_id, version, filename, content_type, size, md5, object_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      entry.id,
+      version,
+      entry.filename,
+      entry.content_type,
+      entry.size,
+      md5,
+      objectKey,
+    )
+    .run();
+}
+
+async function commitFileContentUpdate(
+  env: Env,
+  entry: EntryRow,
+  contentType: string,
+  size: number,
+  md5: string,
+  objectKey: string,
+  expectedVersion = Math.max(1, Number(entry.version || 1)),
+): Promise<number> {
+  const nextVersion = expectedVersion + 1;
+  const updateStatement = env.DB.prepare(
+    `UPDATE entries
+     SET content_type = ?, size = ?, md5 = ?, version = ?, current_object_key = ?, updated_time = CURRENT_TIMESTAMP
+     WHERE id = ? AND COALESCE(version, 1) = ?`,
+  )
+    .bind(contentType, size, md5, nextVersion, objectKey, entry.id, expectedVersion);
+  const versionStatement = env.DB.prepare(
+    `INSERT INTO file_versions
+      (entry_id, version, filename, content_type, size, md5, object_key)
+     SELECT ?, ?, ?, ?, ?, ?, ?
+     WHERE EXISTS (
+       SELECT 1 FROM entries WHERE id = ? AND COALESCE(version, 1) = ?
+     )`,
+  )
+    .bind(entry.id, nextVersion, entry.filename, contentType, size, md5, objectKey, entry.id, nextVersion);
+  const [updateResult, versionResult] = await env.DB.batch([updateStatement, versionStatement]);
+  if (updateResult.meta.changes !== 1 || versionResult.meta.changes !== 1) {
+    throw new Error("file changed while updating; please reload and try again");
+  }
+  return nextVersion;
+}
+
+async function listFileVersions(env: Env, entry: EntryRow): Promise<FileVersionRow[]> {
+  const existing = await env.DB.prepare(
+    `SELECT entry_id, version, filename, content_type, size, md5, created_time, object_key
+     FROM file_versions
+     WHERE entry_id = ?
+     ORDER BY version DESC`,
+  )
+    .bind(entry.id)
+    .all<FileVersionRow>();
+
+  if (existing.results.length > 0) return existing.results;
+
+  const object = await env.BUCKET.get(currentObjectKey(entry));
+  let md5 = entry.md5;
+  if (object?.body) md5 = await md5HexFromStream(object.body);
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO file_versions
+      (entry_id, version, filename, content_type, size, md5, created_time, object_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(entry.id, Math.max(1, Number(entry.version || 1)), entry.filename, entry.content_type, entry.size, md5, entry.upload_time, entry.id)
+    .run();
+  if (!entry.md5 && md5) {
+    await env.DB.prepare("UPDATE entries SET md5 = ? WHERE id = ?").bind(md5, entry.id).run();
+  }
+
+  const refreshed = await env.DB.prepare(
+    `SELECT entry_id, version, filename, content_type, size, md5, created_time, object_key
+     FROM file_versions
+     WHERE entry_id = ?
+     ORDER BY version DESC`,
+  )
+    .bind(entry.id)
+    .all<FileVersionRow>();
+  return refreshed.results;
 }
 
 export function isExpired(iso: string | null): boolean {
@@ -2371,8 +2927,20 @@ async function getGuestLinkById(env: Env, id: string): Promise<GuestLinkRow | nu
 }
 
 async function deleteEntryById(env: Env, id: string): Promise<void> {
+  const versions = await env.DB.prepare(
+    "SELECT object_key FROM file_versions WHERE entry_id = ?",
+  )
+    .bind(id)
+    .all<{ object_key: string }>();
+  const objectKeys = new Set(
+    versions.results
+      .map((version) => version.object_key)
+      .filter((objectKey): objectKey is string => Boolean(objectKey) && objectKey !== id),
+  );
+  for (const objectKey of objectKeys) await env.BUCKET.delete(objectKey);
   await env.BUCKET.delete(id);
   await env.DB.prepare("DELETE FROM download_events WHERE entry_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM file_versions WHERE entry_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM entries WHERE id = ?").bind(id).run();
 }
 
@@ -3483,12 +4051,14 @@ export default {
         return new Response("File expired", { status: 410, headers: withCors() });
       }
 
-      const obj = await env.BUCKET.get(id);
+      const obj = await env.BUCKET.get(currentObjectKey(entry));
       if (!obj) return new Response("Not Found", { status: 404, headers: withCors() });
 
       const h = withCors();
       obj.writeHttpMetadata(h);
       h.set("Content-Disposition", "inline");
+      h.set("Cache-Control", "no-cache, must-revalidate");
+      if (entry.md5) h.set("ETag", `"${entry.md5}"`);
       if (entry.content_type) h.set("Content-Type", entry.content_type);
       return new Response(obj.body, { headers: h });
     }
@@ -3502,7 +4072,7 @@ export default {
         return new Response("File expired", { status: 410, headers: withCors() });
       }
 
-      const obj = await env.BUCKET.get(id);
+      const obj = await env.BUCKET.get(currentObjectKey(entry));
       if (!obj) return new Response("Not Found", { status: 404, headers: withCors() });
 
       await env.DB.prepare(
@@ -3514,6 +4084,8 @@ export default {
       const h = withCors();
       obj.writeHttpMetadata(h);
       h.set("Content-Disposition", `inline; filename="${entry.filename}"`);
+      h.set("Cache-Control", "no-cache, must-revalidate");
+      if (entry.md5) h.set("ETag", `"${entry.md5}"`);
       if (entry.content_type) h.set("Content-Type", entry.content_type);
       return new Response(obj.body, { headers: h });
     }
@@ -3633,11 +4205,20 @@ export default {
 
         for (const item of candidates) {
           await env.BUCKET.put(item.id, item.bytes, { httpMetadata: { contentType: item.contentType } });
+          const md5 = md5Hex(item.bytes);
           await env.DB.prepare(
-            "INSERT INTO entries (id, filename, content_type, size, expiration_time, note, guest_link_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            `INSERT INTO entries
+              (id, filename, content_type, size, md5, version, updated_time, expiration_time, note, guest_link_id)
+             VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?, ?)`,
           )
-            .bind(item.id, item.filename, item.contentType, item.size, expiration, note, guestId)
+            .bind(item.id, item.filename, item.contentType, item.size, md5, expiration, note, guestId)
             .run();
+          await recordNewFileVersion(
+            env,
+            { id: item.id, filename: item.filename, content_type: item.contentType, size: item.size },
+            1,
+            md5,
+          );
         }
         await env.DB.prepare(
           "UPDATE guest_links SET upload_count = COALESCE(upload_count, 0) + ? WHERE id = ?",
@@ -3786,6 +4367,8 @@ export default {
           size?: unknown;
           note?: unknown;
           expirationDays?: unknown;
+          entryId?: unknown;
+          version?: unknown;
         };
         const filename = typeof body.filename === "string" && body.filename.trim()
           ? body.filename.trim().slice(0, 255)
@@ -3803,14 +4386,33 @@ export default {
         const note = typeof body.note === "string" ? body.note.trim().slice(0, 1000) || null : null;
         const expirationInput = body.expirationDays == null ? null : String(body.expirationDays);
         const expiration = expirationToISO(parseExpirationDays(expirationInput));
-        const entryId = generateID();
-        const upload = await env.BUCKET.createMultipartUpload(entryId, { httpMetadata: { contentType } });
+        const requestedEntryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
+        let entryId = generateID();
+        let objectKey = entryId;
+        let isUpdate = 0;
+        let expectedVersion: number | null = null;
+        if (requestedEntryId) {
+          const existing = await getEntryById(env, requestedEntryId);
+          if (!existing) return json({ error: "not found" }, 404);
+          if (filename !== existing.filename) {
+            return json({ error: "updated file must keep the same filename" }, 400);
+          }
+          const requestedVersion = Number(body.version || existing.version || 1);
+          if (!Number.isInteger(requestedVersion) || requestedVersion !== Math.max(1, Number(existing.version || 1))) {
+            return json({ error: "file changed while updating; please reload and try again" }, 409);
+          }
+          entryId = existing.id;
+          expectedVersion = requestedVersion;
+          objectKey = newFileVersionObjectKey(entryId, requestedVersion + 1);
+          isUpdate = 1;
+        }
+        const upload = await env.BUCKET.createMultipartUpload(objectKey, { httpMetadata: { contentType } });
         await env.DB.prepare(
           `INSERT INTO multipart_uploads
-            (upload_id, entry_id, filename, content_type, size, expiration_time, note)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            (upload_id, entry_id, filename, content_type, size, expiration_time, note, is_update, expected_version, object_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-          .bind(upload.uploadId, entryId, filename, contentType, Math.floor(size), expiration, note)
+          .bind(upload.uploadId, entryId, filename, contentType, Math.floor(size), expiration, note, isUpdate, expectedVersion, objectKey)
           .run();
         return json({
           uploadId: upload.uploadId,
@@ -3828,7 +4430,7 @@ export default {
         if (!upload) return json({ error: "multipart upload not found" }, 404);
 
         const bytes = await request.arrayBuffer();
-        const multipart = env.BUCKET.resumeMultipartUpload(upload.entry_id, upload.upload_id);
+        const multipart = env.BUCKET.resumeMultipartUpload(upload.object_key || upload.entry_id, upload.upload_id);
         const part = await multipart.uploadPart(partNumber, bytes);
         await env.DB.prepare(
           `INSERT OR REPLACE INTO multipart_upload_parts (upload_id, part_number, etag)
@@ -3857,23 +4459,63 @@ export default {
           return json({ error: "no uploaded parts found" }, 400);
         }
 
-        const multipart = env.BUCKET.resumeMultipartUpload(upload.entry_id, upload.upload_id);
+        const existingEntry = upload.is_update ? await getEntryById(env, upload.entry_id) : null;
+        if (upload.is_update && !existingEntry) return json({ error: "not found" }, 404);
+        if (
+          existingEntry &&
+          upload.expected_version !== null &&
+          Math.max(1, Number(existingEntry.version || 1)) !== upload.expected_version
+        ) {
+          return json({ error: "file changed while updating; please reload and try again" }, 409);
+        }
+        if (existingEntry) await snapshotCurrentFileVersion(env, existingEntry);
+
+        const uploadObjectKey = upload.object_key || upload.entry_id;
+        const multipart = env.BUCKET.resumeMultipartUpload(uploadObjectKey, upload.upload_id);
         await multipart.complete(parts.results);
-        await env.DB.prepare(
-          "INSERT INTO entries (id, filename, content_type, size, expiration_time, note) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-          .bind(
-            upload.entry_id,
-            upload.filename,
-            upload.content_type || "application/octet-stream",
-            upload.size || 0,
-            upload.expiration_time,
-            upload.note,
+        const completed = await env.BUCKET.get(uploadObjectKey);
+        if (!completed?.body) return json({ error: "completed file not found" }, 500);
+        const md5 = await md5HexFromStream(completed.body);
+        const contentType = upload.content_type || "application/octet-stream";
+        const size = upload.size || 0;
+        let resultingVersion = 1;
+
+        if (existingEntry) {
+          try {
+            resultingVersion = await commitFileContentUpdate(
+              env,
+              existingEntry,
+              contentType,
+              size,
+              md5,
+              uploadObjectKey,
+              upload.expected_version || Math.max(1, Number(existingEntry.version || 1)),
+            );
+          } catch (err) {
+            await env.BUCKET.delete(uploadObjectKey);
+            await env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id = ?").bind(uploadId).run();
+            await env.DB.prepare("DELETE FROM multipart_uploads WHERE upload_id = ?").bind(uploadId).run();
+            const message = String((err as Error)?.message || err);
+            return json({ error: message }, message.includes("file changed") ? 409 : 500);
+          }
+        } else {
+          await env.DB.prepare(
+            `INSERT INTO entries
+              (id, filename, content_type, size, md5, version, updated_time, expiration_time, note)
+             VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?)`,
           )
-          .run();
+            .bind(upload.entry_id, upload.filename, contentType, size, md5, upload.expiration_time, upload.note)
+            .run();
+          await recordNewFileVersion(
+            env,
+            { id: upload.entry_id, filename: upload.filename, content_type: contentType, size },
+            1,
+            md5,
+          );
+        }
         await env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id = ?").bind(uploadId).run();
         await env.DB.prepare("DELETE FROM multipart_uploads WHERE upload_id = ?").bind(uploadId).run();
-        return json({ id: upload.entry_id, filename: upload.filename });
+        return json({ id: upload.entry_id, filename: upload.filename, version: resultingVersion, md5 });
       }
 
       if (url.pathname === "/api/entry/multipart/abort" && request.method === "POST") {
@@ -3883,7 +4525,7 @@ export default {
         const upload = await getMultipartUploadById(env, uploadId);
         if (upload) {
           try {
-            await env.BUCKET.resumeMultipartUpload(upload.entry_id, upload.upload_id).abort();
+            await env.BUCKET.resumeMultipartUpload(upload.object_key || upload.entry_id, upload.upload_id).abort();
           } catch {
             // Ignore abort failures so local metadata can still be cleaned.
           }
@@ -3923,13 +4565,58 @@ export default {
         }
 
         await env.BUCKET.put(id, bytes, { httpMetadata: { contentType } });
+        const md5 = md5Hex(bytes);
         await env.DB.prepare(
-          "INSERT INTO entries (id, filename, content_type, size, expiration_time, note) VALUES (?, ?, ?, ?, ?, ?)",
+          `INSERT INTO entries
+            (id, filename, content_type, size, md5, version, updated_time, expiration_time, note)
+           VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?)`,
         )
-          .bind(id, filename, contentType, size, expiration, note)
+          .bind(id, filename, contentType, size, md5, expiration, note)
           .run();
+        await recordNewFileVersion(env, { id, filename, content_type: contentType, size }, 1, md5);
 
-        return json({ id, filename });
+        return json({ id, filename, md5 });
+      }
+
+      if (url.pathname.startsWith("/api/entry/") && url.pathname.endsWith("/content") && (request.method === "POST" || request.method === "PUT")) {
+        const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+        const entry = await getEntryById(env, id);
+        if (!entry) return json({ error: "not found" }, 404);
+
+        const fd = await request.formData();
+        const fileValue = fd.get("file");
+        if (
+          !fileValue ||
+          typeof fileValue !== "object" ||
+          !("arrayBuffer" in fileValue) ||
+          !("name" in fileValue)
+        ) {
+          return json({ error: "file is required" }, 400);
+        }
+        const file = fileValue as File;
+        if (file.name !== entry.filename) {
+          return json({ error: "updated file must keep the same filename" }, 400);
+        }
+
+        const expectedVersion = Number(fd.get("version") || entry.version || 1);
+        if (!Number.isInteger(expectedVersion) || expectedVersion !== Math.max(1, Number(entry.version || 1))) {
+          return json({ error: "file changed while updating; please reload and try again" }, 409);
+        }
+        const bytes = await file.arrayBuffer();
+        await snapshotCurrentFileVersion(env, entry);
+        const contentType = file.type || "application/octet-stream";
+        const objectKey = newFileVersionObjectKey(id, expectedVersion + 1);
+        await env.BUCKET.put(objectKey, bytes, { httpMetadata: { contentType } });
+        const md5 = md5Hex(bytes);
+        let version: number;
+        try {
+          version = await commitFileContentUpdate(env, entry, contentType, bytes.byteLength, md5, objectKey, expectedVersion);
+        } catch (err) {
+          await env.BUCKET.delete(objectKey);
+          const message = String((err as Error)?.message || err);
+          return json({ error: message }, message.includes("file changed") ? 409 : 500);
+        }
+        return json({ ok: true, id, filename: entry.filename, version, md5 });
       }
 
       if (url.pathname === "/api/entries" && request.method === "GET") {
@@ -3939,7 +4626,10 @@ export default {
              e.filename,
              e.content_type,
              e.size,
+             e.md5,
+             COALESCE(e.version, 1) AS version,
              e.upload_time,
+             COALESCE(e.updated_time, e.upload_time) AS updated_time,
              e.expiration_time,
              e.note,
              COALESCE(d.count, 0) AS download_count
@@ -3952,6 +4642,40 @@ export default {
            ORDER BY e.upload_time DESC`,
         ).all();
         return json(res.results);
+      }
+
+      if (url.pathname.startsWith("/api/entry/") && url.pathname.endsWith("/versions") && request.method === "GET") {
+        const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+        const entry = await getEntryById(env, id);
+        if (!entry) return json({ error: "not found" }, 404);
+        const versions = await listFileVersions(env, entry);
+        return json({
+          versions: versions.map(({ object_key: _objectKey, ...version }) => version),
+        });
+      }
+
+      if (url.pathname.startsWith("/api/entry/") && url.pathname.includes("/versions/") && url.pathname.endsWith("/content") && request.method === "GET") {
+        const parts = url.pathname.split("/");
+        const id = decodeURIComponent(parts[3] || "");
+        const version = Number(parts[5] || 0);
+        if (!Number.isInteger(version) || version <= 0) return json({ error: "invalid version" }, 400);
+        const entry = await getEntryById(env, id);
+        if (!entry) return json({ error: "not found" }, 404);
+        let fileVersion = await getFileVersion(env, id, version);
+        if (!fileVersion) {
+          await listFileVersions(env, entry);
+          fileVersion = await getFileVersion(env, id, version);
+        }
+        if (!fileVersion) return json({ error: "version not found" }, 404);
+
+        const object = await env.BUCKET.get(fileVersion.object_key);
+        if (!object) return new Response("Not Found", { status: 404, headers: withCors() });
+        const h = withCors();
+        object.writeHttpMetadata(h);
+        h.set("Content-Disposition", `attachment; filename="${fileVersion.filename.replaceAll('"', "")}"`);
+        if (fileVersion.content_type) h.set("Content-Type", fileVersion.content_type);
+        if (fileVersion.md5) h.set("ETag", `"${fileVersion.md5}"`);
+        return new Response(object.body, { headers: h });
       }
 
       if (url.pathname.startsWith("/api/entry/") && !url.pathname.endsWith("/downloads") && request.method === "GET") {

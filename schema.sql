@@ -4,7 +4,11 @@ CREATE TABLE IF NOT EXISTS entries (
   filename TEXT NOT NULL,
   content_type TEXT,
   size INTEGER NOT NULL,
+  md5 TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
+  current_object_key TEXT,
   upload_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_time DATETIME DEFAULT CURRENT_TIMESTAMP,
   expiration_time TEXT,
   note TEXT,
   guest_link_id TEXT
@@ -34,6 +38,18 @@ CREATE TABLE IF NOT EXISTS download_events (
   user_agent TEXT
 );
 
+CREATE TABLE IF NOT EXISTS file_versions (
+  entry_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  filename TEXT NOT NULL,
+  content_type TEXT,
+  size INTEGER NOT NULL,
+  md5 TEXT,
+  created_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+  object_key TEXT NOT NULL,
+  PRIMARY KEY(entry_id, version)
+);
+
 CREATE TABLE IF NOT EXISTS multipart_uploads (
   upload_id TEXT PRIMARY KEY,
   entry_id TEXT NOT NULL,
@@ -42,6 +58,9 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
   size INTEGER NOT NULL DEFAULT 0,
   expiration_time TEXT,
   note TEXT,
+  is_update INTEGER NOT NULL DEFAULT 0,
+  expected_version INTEGER,
+  object_key TEXT,
   created_time DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

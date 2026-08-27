@@ -9,6 +9,7 @@ A lightweight file sharing service built on Cloudflare Workers + D1 + R2.
 - Password-protected management UI
 - File upload via select, drag-and-drop, and paste text
 - File list, metadata, edit, and delete
+- Same-name file replacement with unchanged share path, MD5 tracking, and version history
 - Cloud clipboard (`/clips` + `/:name`) for quick text sync across devices
   - Per-clipboard password protection
   - Auto-save (including save on mouse leave)
