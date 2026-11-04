@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title data-i18n="PicoShare 上传助手">PicoShare Uploader</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <img class="brand-logo" src="icons/picoshare.svg" alt="PicoShare" />
+      <div><h1>PicoShare</h1><p data-i18n="文件分享助手">文件分享助手</p></div>
+      <label class="language-control">
+        <span data-i18n="语言">语言</span>
+        <select id="language-select" aria-label="语言" data-i18n-aria-label="语言">
+          <option value="auto" data-i18n="跟随浏览器">跟随浏览器</option>
+          <option value="zh" data-i18n="简体中文">简体中文</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+    </header>
+
+    <section class="privacy-notice" aria-labelledby="privacy-notice-title">
+      <h2 id="privacy-notice-title" data-i18n="data_use_title">上传数据说明</h2>
+      <p data-i18n="data_use_detail">当你主动点击上传、网页 HTML、长截图、图片保存或网页链接操作时，扩展会读取你选择的文件、当前页面内容或图片，并发送到你设置的 PicoShare 服务以生成分享链接。保存网页图片时，来源网站会收到读取请求，浏览器可能按该站点规则附带凭据；官方托管服务会处理访问者 IP 和浏览器信息以统计下载次数。API Key 和设置保存在本浏览器扩展存储中；持有分享链接的人可能可以打开对应内容。</p>
+      <label class="consent-label" for="data-use-consent">
+        <input id="data-use-consent" type="checkbox" />
+        <span data-i18n="data_use_consent">我已阅读并同意上述数据处理方式。</span>
+      </label>
+      <a id="privacy-policy-link" href="https://pico.justnow.uk/privacy" target="_blank" rel="noreferrer" data-i18n="privacy_policy_link">查看隐私政策</a>
+    </section>
+
+    <section class="card">
+      <h2 data-i18n="连接账户">连接账户</h2>
+      <label for="base-url" data-i18n="PicoShare 网站地址">PicoShare 网站地址</label>
+      <input id="base-url" type="url" placeholder="https://share.example.com" autocomplete="url" />
+      <label for="api-key">API Key</label>
+      <input id="api-key" type="password" data-i18n-placeholder="粘贴账户页创建的 API Key" placeholder="粘贴账户页创建的 API Key" autocomplete="off" />
+      <button id="save-settings" class="secondary" type="button" data-i18n="保存并授权网站">保存并授权网站</button>
+      <p class="hint" data-i18n="密钥保存在本浏览器扩展存储中。首次保存会请求访问你填写的 PicoShare 网站。">密钥保存在本浏览器扩展存储中。首次保存会请求访问你填写的 PicoShare 网站。</p>
+    </section>
+
+    <section class="card floating-card">
+      <div class="section-heading">
+        <div>
+          <h2 data-i18n="常驻网页按钮">常驻网页按钮</h2>
+          <p class="hint" data-i18n="在网页右下角显示 PicoShare 小图标，不用每次打开插件菜单。">在网页右下角显示 PicoShare 小图标，不用每次打开插件菜单。</p>
+        </div>
+        <label class="switch" for="floating-enabled">
+          <input id="floating-enabled" type="checkbox" />
+          <span class="switch-track" aria-hidden="true"></span>
+          <span class="sr-only" data-i18n="启用常驻网页按钮">启用常驻网页按钮</span>
+        </label>
+      </div>
+      <p class="hint" data-i18n="按住常驻图标可拖动并记忆位置。左键打开菜单：可将整页截图上传为 PNG、选择本地文件上传，或上传当前网页 HTML；右键将清理后的当前网页地址保存为 .txt 分享（会移除查询参数和片段）。首次启用会请求所有网站权限，供常驻图标和长截图使用。">按住常驻图标可拖动并记忆位置。左键打开菜单：可将整页截图上传为 PNG、选择本地文件上传，或上传当前网页 HTML；右键将清理后的当前网页地址保存为 .txt 分享（会移除查询参数和片段）。首次启用会请求所有网站权限，供常驻图标和长截图使用。</p>
+    </section>
+
+    <section class="card">
+      <h2 data-i18n="上传本地文件">上传本地文件</h2>
+      <input id="file-input" type="file" />
+      <button id="upload-file" type="button" data-i18n="上传并生成分享链接">上传并生成分享链接</button>
+    </section>
+
+    <section class="context-help">
+      <strong data-i18n="网页右键菜单">网页右键菜单</strong>
+      <p data-i18n="网页空白处右键可上传当前网页 HTML；图片上右键可保存图片到 PicoShare。完成后会打开分享链接。">网页空白处右键可上传当前网页 HTML；图片上右键可保存图片到 PicoShare。完成后会打开分享链接。</p>
+      <p class="hint" data-i18n="页面 HTML 会以纯文本类型分享，打开链接时显示源码，不会执行网页脚本。">页面 HTML 会以纯文本类型分享，打开链接时显示源码，不会执行网页脚本。</p>
+    </section>
+
+    <p id="status" role="status" aria-live="polite"></p>
+    <section id="success-alert" class="success-alert hidden" role="status" aria-live="assertive">
+      <span class="success-mark" aria-hidden="true">✓</span>
+      <div><strong id="success-title" data-i18n="上传成功">上传成功</strong><p id="success-message" data-i18n="分享链接已生成。">分享链接已生成。</p></div>
+    </section>
+    <section id="result" class="result hidden" aria-live="polite">
+      <strong id="result-title" data-i18n="上传完成">上传完成</strong>
+      <a id="share-link" target="_blank" rel="noreferrer"></a>
+      <button id="copy-link" class="secondary" type="button" data-i18n="复制分享链接">复制分享链接</button>
+    </section>
+    <a class="docs-link hidden" href="#" id="docs-link" target="_blank" rel="noreferrer" data-i18n="API 调用手册">API 调用手册</a>
+  </main>
+  <script src="i18n.js"></script>
+  <script src="api.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

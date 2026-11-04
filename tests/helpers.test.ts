@@ -6,12 +6,14 @@ import {
   cleanupExpiredEntries,
   escapeHtml,
   expirationToISO,
+  isAllowedRequestOrigin,
   isExpired,
   md5Hex,
   normalizeClipboardPassword,
   parseMultipartPartNumber,
   parseDateFromUnknown,
   parseExpirationDays,
+  resolveUploadExpirationDays,
   shouldUseMultipartUpload,
   sanitizeClipboardSlug,
   sha256Hex,
@@ -32,6 +34,23 @@ describe("parseExpirationDays", () => {
   });
 });
 
+describe("resolveUploadExpirationDays", () => {
+  it("defaults hosted uploads to the plan maximum", () => {
+    expect(resolveUploadExpirationDays(null, 365)).toBe(365);
+    expect(resolveUploadExpirationDays(undefined, 30)).toBe(30);
+  });
+
+  it("allows permanent Pro uploads but keeps Free uploads capped", () => {
+    expect(resolveUploadExpirationDays("0", 365)).toBeNull();
+    expect(resolveUploadExpirationDays("0", 30)).toBe(30);
+  });
+
+  it("preserves self-hosted expiration behavior", () => {
+    expect(resolveUploadExpirationDays("0", null)).toBeNull();
+    expect(resolveUploadExpirationDays("90", null)).toBe(90);
+  });
+});
+
 describe("expirationToISO and isExpired", () => {
   it("returns null when no expiration days is set", () => {
     expect(expirationToISO(null)).toBeNull();
@@ -45,6 +64,23 @@ describe("expirationToISO and isExpired", () => {
     expect(isExpired("2000-01-01T00:00:00.000Z")).toBe(true);
     expect(isExpired("not-a-date")).toBe(false);
     expect(isExpired(null)).toBe(false);
+  });
+});
+
+describe("isAllowedRequestOrigin", () => {
+  const publicOrigin = "https://pico.justnow.uk";
+  const workerURL = "https://pico.ask.dpdns.org/api/admin/pro-grant";
+
+  it("trusts only the configured public origin behind a proxy", () => {
+    expect(isAllowedRequestOrigin(publicOrigin, publicOrigin, workerURL)).toBe(true);
+    expect(isAllowedRequestOrigin("https://pico.ask.dpdns.org", publicOrigin, workerURL)).toBe(false);
+    expect(isAllowedRequestOrigin("https://attacker.example", publicOrigin, workerURL)).toBe(false);
+  });
+
+  it("falls back to the request origin when no public URL is configured", () => {
+    expect(isAllowedRequestOrigin("https://pico.ask.dpdns.org", undefined, workerURL)).toBe(true);
+    expect(isAllowedRequestOrigin(null, publicOrigin, workerURL)).toBe(false);
+    expect(isAllowedRequestOrigin(publicOrigin, "invalid-url", workerURL)).toBe(false);
   });
 });
 

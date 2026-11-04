@@ -1,0 +1,7 @@
+interface:
+  display_name: "PicoShare 文件与云便签"
+  short_description: "通过 API 上传与搜索文件、获取分享链接，并创建和读取云便签"
+  default_prompt: "使用 $picoshare 上传或查找文件、生成分享链接，或创建和读取云便签。"
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,20 @@
+{
+  "name": "picoshare-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Command-line client for PicoShare files and cloud notes",
+  "type": "module",
+  "bin": {
+    "picoshare": "./bin/picoshare.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node ./bin/picoshare.mjs",
+    "package:agent-kit": "sh ./package-agent-kit.sh"
+  },
+  "dependencies": {
+    "commander": "^13.1.0"
+  }
+}

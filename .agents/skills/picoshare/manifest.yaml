@@ -1,0 +1,19 @@
+name: picoshare
+version: 1.0.0
+description: >-
+  通过 PicoShare API 上传和查找文件、获取文件分享链接，以及创建、读取、更新和分享云便签。
+category: developer-tools
+author: PicoShare
+dependencies: "curl (用于 Bash HTTP 请求)、PICOSHARE_BASE_URL、PICOSHARE_API_KEY"
+interface:
+  base_url_env: PICOSHARE_BASE_URL
+  api_key_env: PICOSHARE_API_KEY
+  auth_header: "X-API-Key"
+  file_upload_endpoint: "POST /api/entry"
+  file_list_endpoint: "GET /api/entries"
+  clipboard_list_endpoint: "GET /clipboard-api/list"
+  clipboard_item_endpoint: "/clipboard-api/item/{slug}"
+  file_share_path: "/-<id>"
+  clipboard_share_path: "/c/<publicId>"
+policy:
+  allow_implicit_invocation: true

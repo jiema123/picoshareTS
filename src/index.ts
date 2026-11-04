@@ -1,12 +1,58 @@
-export interface Env {
+import { createAuth, isSaasEnabled, migrateAuthSchema } from "./lib/auth";
+import { accountPage } from "./pages/account";
+import { apiDocsPage } from "./pages/api-docs";
+import { landingPage } from "./pages/landing";
+import { privacyPolicyPage } from "./pages/privacy";
+import {
+  ADMIN_OWNER_ID,
+  ensureSaasAccount,
+  ensureSaasSchema,
+  getAccountEntitlement,
+  getManualProGrant,
+  getMonthlyApiRequests,
+  getOwnerStorageBytes,
+  grantManualPro,
+  isSaasSuperadmin,
+  LOCAL_OWNER_ID,
+  recordApiRequest,
+  recordUploadBytes,
+  releaseStorageReservation,
+  reserveStorageBytes,
+  revokeManualPro,
+  type AccountEntitlement,
+} from "./lib/saas";
+import {
+  createWaffoCustomerPortalLink,
+  createWaffoSubscriptionCheckout,
+  verifyWaffoWebhook,
+  type WaffoEnv,
+  type WaffoWebhookEvent,
+  type WaffoWebhookEventData,
+} from "./lib/waffo";
+import { createOpcPayPurchase, getOpcPayAccess, getOpcPayProduct, type OpcPayEnv } from "./lib/opcpay";
+
+export interface Env extends WaffoEnv, OpcPayEnv {
+  ASSETS: Fetcher;
   DB: D1Database;
   BUCKET: R2Bucket;
   CLIPBOARD: KVNamespace;
   PS_SHARED_SECRET: string;
+  PS_API_KEY?: string;
+  ENABLE_SAAS?: string;
+  BETTER_AUTH_SECRET?: string;
+  BETTER_AUTH_URL?: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  SAAS_BOOTSTRAP_EMAIL?: string;
+  SAAS_SUPERADMIN_EMAILS?: string;
+  WAFFO_PRODUCT_PRO_MONTHLY?: string;
+  WAFFO_PRODUCT_PRO_YEARLY?: string;
+  WAFFO_CURRENCY?: string;
 }
 
 type EntryRow = {
   id: string;
+  owner_id?: string | null;
   filename: string;
   content_type: string | null;
   size: number;
@@ -33,6 +79,7 @@ type FileVersionRow = {
 
 type GuestLinkRow = {
   id: string;
+  owner_id?: string | null;
   label: string | null;
   created_time: string | null;
   max_file_bytes: number | null;
@@ -42,12 +89,11 @@ type GuestLinkRow = {
   upload_count: number | null;
 };
 
-const ID_CHARS = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const ID_LENGTH = 10;
 const CLIPBOARD_KEY_PREFIX = "clipboard:";
 export const MAX_CLIPBOARD_CHARS = 1_000_000;
 const MULTIPART_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
 const MULTIPART_UPLOAD_THRESHOLD_BYTES = 100 * 1024 * 1024;
+const API_KEY_EXPIRATION_SECONDS = new Set([7, 30, 90, 180, 365].map((days) => days * 24 * 60 * 60));
 const RESERVED_CLIPBOARD_SLUGS = new Set([
   "api",
   "guest",
@@ -59,6 +105,7 @@ const RESERVED_CLIPBOARD_SLUGS = new Set([
 
 type ClipboardRecord = {
   slug: string;
+  publicId?: string;
   content: string;
   createdAt: string;
   updatedAt: string;
@@ -67,6 +114,7 @@ type ClipboardRecord = {
 
 type ClipboardSummary = {
   slug: string;
+  publicId?: string;
   updatedAt: string;
   charCount: number;
   itemCount: number;
@@ -75,6 +123,7 @@ type ClipboardSummary = {
 
 type MultipartUploadRow = {
   upload_id: string;
+  owner_id?: string | null;
   entry_id: string;
   filename: string;
   content_type: string;
@@ -84,6 +133,9 @@ type MultipartUploadRow = {
   is_update: number;
   expected_version: number | null;
   object_key: string | null;
+  complete_token: string | null;
+  complete_started_at: string | null;
+  active_parts: number;
 };
 
 const MD5_SHIFT_AMOUNTS = [
@@ -223,18 +275,17 @@ async function md5HexFromStream(body: ReadableStream<Uint8Array>): Promise<strin
 }
 
 export function generateID(): string {
-  let result = "";
-  for (let i = 0; i < ID_LENGTH; i += 1) {
-    result += ID_CHARS.charAt(Math.floor(Math.random() * ID_CHARS.length));
-  }
-  return result;
+  return crypto.randomUUID().replaceAll("-", "");
 }
 
 function withCors(headers: HeadersInit = {}): Headers {
   const h = new Headers(headers);
+  // Only the public landing page opts back into indexing. All Worker-generated
+  // pages, APIs, share links, previews, and downloads are excluded by default.
+  if (!h.has("X-Robots-Tag")) h.set("X-Robots-Tag", "noindex, nofollow, noarchive");
   h.set("Access-Control-Allow-Origin", "*");
   h.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  h.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  h.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
   return h;
 }
 
@@ -245,11 +296,25 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function jsonNoStore(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: withCors({ "Content-Type": "application/json", "Cache-Control": "no-store" }),
+  });
+}
+
 export function parseExpirationDays(input: string | null): number | null {
   if (!input) return null;
   const n = Number.parseInt(input, 10);
   if (!Number.isFinite(n) || n <= 0) return null;
   return Math.min(n, 3650);
+}
+
+export function resolveUploadExpirationDays(input: unknown, maxDays: number | null): number | null {
+  if (maxDays === null) return parseExpirationDays(input == null ? null : String(input));
+  if (input === "0" || input === 0) return maxDays > 30 ? null : maxDays;
+  const requested = parseExpirationDays(input == null ? null : String(input));
+  return Math.min(requested || maxDays, maxDays);
 }
 
 export function parseMultipartPartNumber(input: string | null): number | null {
@@ -269,6 +334,14 @@ export function expirationToISO(days: number | null): string | null {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString();
+}
+
+export function isAllowedRequestOrigin(origin: string | null, configuredBaseURL: string | undefined, requestURL: string): boolean {
+  try {
+    return origin === new URL(configuredBaseURL?.trim() || requestURL).origin;
+  } catch {
+    return false;
+  }
 }
 
 function boolFromSetting(value: string | null): boolean {
@@ -340,14 +413,17 @@ async function ensureSchema(env: Env): Promise<void> {
     "ALTER TABLE multipart_uploads ADD COLUMN is_update INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE multipart_uploads ADD COLUMN expected_version INTEGER",
     "ALTER TABLE multipart_uploads ADD COLUMN object_key TEXT",
+    "ALTER TABLE multipart_uploads ADD COLUMN complete_token TEXT",
+    "ALTER TABLE multipart_uploads ADD COLUMN complete_started_at DATETIME",
+    "ALTER TABLE multipart_uploads ADD COLUMN active_parts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE multipart_uploads ADD COLUMN active_parts_updated_at DATETIME",
   ];
 
   for (const stmt of alterStatements) {
-    try {
-      await env.DB.exec(stmt);
-    } catch {
-      // Ignore if column already exists in deployed database.
-    }
+    const match = stmt.match(/^ALTER TABLE ([A-Za-z_][A-Za-z0-9_]*) ADD COLUMN ([A-Za-z_][A-Za-z0-9_]*)/i);
+    if (!match) throw new Error(`Invalid schema alteration: ${stmt}`);
+    const columns = await env.DB.prepare(`PRAGMA table_info(${match[1]})`).all<{ name: string }>();
+    if (!columns.results.some((column) => column.name === match[2])) await env.DB.exec(stmt);
   }
 
   await env.DB.prepare(
@@ -356,13 +432,21 @@ async function ensureSchema(env: Env): Promise<void> {
   await env.DB.prepare(
     "INSERT OR IGNORE INTO settings(key, value) VALUES ('default_expiration_days', '30')",
   ).run();
+
+  await ensureSaasSchema(env);
 }
 
 let schemaReady: Promise<void> | null = null;
 
-async function ensureSchemaOnce(env: Env): Promise<void> {
+async function ensureSchemaOnce(
+  env: Env,
+  auth?: ReturnType<typeof createAuth>,
+): Promise<void> {
   if (!schemaReady) {
-    schemaReady = ensureSchema(env).catch((err) => {
+    schemaReady = (async () => {
+      await ensureSchema(env);
+      if (auth) await migrateAuthSchema(auth);
+    })().catch((err) => {
       schemaReady = null;
       throw err;
     });
@@ -374,11 +458,264 @@ function unauthorized(): Response {
   return new Response("Unauthorized", { status: 401, headers: withCors() });
 }
 
-async function requireAuth(request: Request, env: Env): Promise<boolean> {
-  return request.headers.get("Authorization") === env.PS_SHARED_SECRET;
+async function resolveSaasSuperadmin(
+  request: Request,
+  env: Env,
+  auth: ReturnType<typeof createAuth> | null,
+  principal: Principal,
+): Promise<{ userId: string; email: string } | null> {
+  if (!auth || principal.authType !== "session" || !principal.userId) return null;
+  const session = await auth.api.getSession({ headers: request.headers });
+  if (!session || session.user.id !== principal.userId || !session.user.emailVerified) return null;
+  if (!isSaasSuperadmin(session.user.email, env.SAAS_SUPERADMIN_EMAILS)) return null;
+  return { userId: session.user.id, email: session.user.email.trim().toLowerCase() };
 }
 
-function htmlPage(): string {
+type Principal = {
+  ownerId: string;
+  userId: string | null;
+  email: string | null;
+  authType: "session" | "api-key" | "local-secret" | "admin-secret";
+  isAdmin: boolean;
+};
+
+function requestCredential(request: Request): string | null {
+  const apiKeyHeader = request.headers.get("X-API-Key");
+  const authorization = request.headers.get("Authorization");
+  const bearerMatch = authorization?.match(/^Bearer\s+(.+)$/i);
+  return apiKeyHeader ?? bearerMatch?.[1] ?? authorization;
+}
+
+async function resolvePrincipal(
+  request: Request,
+  env: Env,
+  auth: ReturnType<typeof createAuth> | null,
+  saasEnabled: boolean,
+): Promise<Principal | null> {
+  const credential = requestCredential(request);
+
+  if (credential && credential === env.PS_SHARED_SECRET) {
+    return {
+      ownerId: saasEnabled ? ADMIN_OWNER_ID : LOCAL_OWNER_ID,
+      userId: null,
+      email: null,
+      authType: saasEnabled ? "admin-secret" : "local-secret",
+      isAdmin: true,
+    };
+  }
+
+  if (!saasEnabled || !auth) {
+    if (credential && credential === env.PS_API_KEY) {
+      return { ownerId: LOCAL_OWNER_ID, userId: null, email: null, authType: "local-secret", isAdmin: true };
+    }
+    return null;
+  }
+
+  const apiKey = request.headers.get("X-API-Key") || credential;
+  if (apiKey) {
+    const result = await auth.api.verifyApiKey({ body: { key: apiKey } });
+    if (!result.valid || !result.key?.referenceId) return null;
+    const userId = result.key.referenceId;
+    if (await env.DB.prepare("SELECT 1 AS deleted FROM deleted_saas_users WHERE user_id = ? LIMIT 1")
+      .bind(userId).first<{ deleted: number }>()) return null;
+    await ensureSaasAccount(env, userId, null);
+    return { ownerId: userId, userId, email: null, authType: "api-key", isAdmin: false };
+  }
+
+  const session = await auth.api.getSession({ headers: request.headers });
+  if (!session) return null;
+  if (await env.DB.prepare("SELECT 1 AS deleted FROM deleted_saas_users WHERE user_id = ? LIMIT 1")
+    .bind(session.user.id).first<{ deleted: number }>()) return null;
+  await ensureSaasAccount(env, session.user.id, session.user.email);
+  return {
+    ownerId: session.user.id,
+    userId: session.user.id,
+    email: session.user.email,
+    authType: "session",
+    isAdmin: false,
+  };
+}
+
+function checkoutPeriodEnd(productId: string, env: Env, periodStart: string): string | null {
+  const months = productId === env.WAFFO_PRODUCT_PRO_MONTHLY
+    ? 1
+    : productId === env.WAFFO_PRODUCT_PRO_YEARLY
+      ? 12
+      : 0;
+  if (!months) return null;
+
+  const parsedStart = Date.parse(periodStart);
+  const end = new Date(Number.isFinite(parsedStart) ? parsedStart : Date.now());
+  const dayOfMonth = end.getUTCDate();
+  end.setUTCDate(1);
+  end.setUTCMonth(end.getUTCMonth() + months);
+  const lastDayOfTargetMonth = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() + 1, 0)).getUTCDate();
+  end.setUTCDate(Math.min(dayOfMonth, lastDayOfTargetMonth));
+  return end.toISOString();
+}
+
+async function handleWaffoWebhook(request: Request, env: Env): Promise<Response> {
+  if (!isSaasEnabled(env.ENABLE_SAAS)) return new Response("Not Found", { status: 404 });
+  if (env.WAFFO_ENV !== "test" && env.WAFFO_ENV !== "prod") {
+    return json({ error: "Set WAFFO_ENV to test or prod before enabling Waffo webhooks" }, 503);
+  }
+
+  let event: WaffoWebhookEvent<WaffoWebhookEventData>;
+  try {
+    event = await verifyWaffoWebhook<WaffoWebhookEventData>(request, env, { environment: env.WAFFO_ENV });
+  } catch (err) {
+    return json({ error: String((err as Error)?.message || err) }, 400);
+  }
+  if (!event.mode || event.mode.toLowerCase() !== env.WAFFO_ENV) {
+    return json({ error: "Waffo event environment does not match this deployment" }, 400);
+  }
+  if (env.WAFFO_STORE_ID && event.storeId !== env.WAFFO_STORE_ID) {
+    return json({ error: "Waffo event belongs to a different store" }, 400);
+  }
+
+  const data = event.data || {};
+  // Waffo's `id` is unique per webhook delivery and is the retry-safe dedupe key.
+  const eventId = event.id;
+  if (!eventId) return json({ error: "Waffo event id is required" }, 400);
+  const reference = data.orderMerchantExternalId || null;
+  const attempt = reference
+    ? await env.DB.prepare(
+        "SELECT reference, user_id, plan_code, product_id, status FROM billing_checkout_attempts WHERE reference = ?",
+      ).bind(reference).first<{ reference: string; user_id: string; plan_code: string; product_id: string; status: string }>()
+    : null;
+  const identity = data.merchantProvidedBuyerIdentity || null;
+  const userId = attempt?.user_id || identity;
+  const eventType = event.eventType || "unknown";
+  const existingAccount = userId
+    ? await env.DB.prepare("SELECT provider_product_id FROM billing_accounts WHERE user_id = ?")
+        .bind(userId).first<{ provider_product_id: string | null }>()
+    : null;
+  const productId = data.productId || attempt?.product_id || existingAccount?.provider_product_id || "";
+  const productIsPro = Boolean(
+    [env.WAFFO_PRODUCT_PRO_MONTHLY, env.WAFFO_PRODUCT_PRO_YEARLY].includes(productId),
+  );
+
+  const lifecycleEvents = new Set([
+    "subscription.activated", "subscription.renewed", "subscription.recovered",
+    "subscription.plan_changed", "subscription.canceling", "subscription.uncanceled",
+    "subscription.canceled", "subscription.past_due", "subscription.payment_succeeded", "refund.succeeded",
+  ]);
+  if (lifecycleEvents.has(eventType) && !userId) {
+    return json({ error: "Waffo event could not be matched to a PicoShare account" }, 400);
+  }
+  if (userId && await env.DB.prepare("SELECT 1 AS deleted FROM deleted_saas_users WHERE user_id = ? LIMIT 1")
+    .bind(userId).first<{ deleted: number }>()) {
+    return json({ received: true, ignored: true, reason: "account_deleted" });
+  }
+  if (eventType === "subscription.activated" && (!attempt || !productIsPro || attempt.plan_code !== "pro")) {
+    return json({ error: "Waffo activation does not match a pending Pro checkout" }, 400);
+  }
+  if (lifecycleEvents.has(eventType) && !productIsPro) {
+    return json({ received: true, ignored: true });
+  }
+  if (attempt && identity && attempt.user_id !== identity) {
+    return json({ error: "Waffo buyer identity does not match the checkout" }, 400);
+  }
+  if (userId) await ensureSaasAccount(env, userId, null);
+
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO billing_webhook_events(event_id, event_type, reference, processing_status)
+     VALUES (?, ?, ?, 'processing')`,
+  ).bind(eventId, eventType, reference).run();
+  await env.DB.prepare(
+    `UPDATE billing_webhook_events SET processing_status = 'processing'
+     WHERE event_id = ? AND processing_status = 'failed'`,
+  ).bind(eventId).run();
+
+  const currentPeriodStart = data.currentPeriodStart || null;
+  const currentPeriodEnd = data.currentPeriodEnd || null;
+  const orderId = data.orderId || null;
+  const timestamp = new Date().toISOString();
+  const updateAccount = async (
+    status: string,
+    grantPro: boolean,
+    graceUntil: string | null = null,
+    period: { start: string | null; end: string | null } | null = null,
+  ) => {
+    if (!userId) return;
+    await env.DB.prepare(
+      `UPDATE billing_accounts
+       SET plan_code = ?, status = ?, provider = 'waffo',
+           provider_order_id = COALESCE(?, provider_order_id),
+           provider_product_id = COALESCE(?, provider_product_id),
+           current_period_start = COALESCE(?, current_period_start),
+           current_period_end = COALESCE(?, current_period_end),
+           grace_until = ?, updated_at = ?
+       WHERE user_id = ?
+         AND EXISTS (SELECT 1 FROM billing_webhook_events WHERE event_id = ? AND processing_status = 'processing')`,
+    ).bind(
+      grantPro ? "pro" : "free", status, orderId, productId || null,
+      period?.start ?? currentPeriodStart, period?.end ?? currentPeriodEnd,
+      graceUntil, timestamp, userId, eventId,
+    ).run();
+  };
+
+  try {
+    switch (eventType) {
+      case "subscription.activated":
+      case "subscription.renewed":
+      case "subscription.recovered":
+      case "subscription.plan_changed":
+      case "subscription.uncanceled":
+        {
+          const periodStart = currentPeriodStart || event.timestamp || timestamp;
+          const calculatedEnd = currentPeriodEnd || checkoutPeriodEnd(productId, env, periodStart);
+          if (!calculatedEnd || !Number.isFinite(Date.parse(calculatedEnd)) || Date.parse(calculatedEnd) <= Date.now()) {
+            throw new Error("Waffo subscription event is missing a valid billing period end");
+          }
+          await updateAccount("active", true, null, { start: periodStart, end: calculatedEnd });
+        }
+        break;
+      case "subscription.payment_succeeded":
+        // Some Waffo webhook configurations deliver payment confirmations without
+        // the separate activation event. Only use this as an activation fallback
+        // for the matching unpaid PicoShare checkout; recurring payment notices
+        // must not extend access without the lifecycle event's period dates.
+        if (attempt && attempt.plan_code === "pro" && attempt.status !== "paid") {
+          const eventTimestamp = Date.parse(event.timestamp || "");
+          const periodStart = currentPeriodStart ||
+            (Number.isFinite(eventTimestamp) ? new Date(eventTimestamp).toISOString() : timestamp);
+          const periodEnd = currentPeriodEnd || checkoutPeriodEnd(productId, env, periodStart);
+          if (periodEnd) await updateAccount("active", true, null, { start: periodStart, end: periodEnd });
+        }
+        break;
+      case "subscription.canceling":
+        await updateAccount("canceling", true);
+        break;
+      case "subscription.past_due":
+        await updateAccount("past_due", true, new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString());
+        break;
+      case "subscription.canceled":
+        await updateAccount("canceled", false);
+        break;
+      case "refund.succeeded":
+        await updateAccount("refunded", false);
+        break;
+    }
+    if (attempt && eventType.startsWith("subscription.")) {
+      await env.DB.prepare(
+        "UPDATE billing_checkout_attempts SET status = 'paid' WHERE reference = ?",
+      ).bind(attempt.reference).run();
+    }
+    await env.DB.prepare(
+      `UPDATE billing_webhook_events SET processing_status = 'processed', processed_at = CURRENT_TIMESTAMP
+       WHERE event_id = ? AND processing_status = 'processing'`,
+    ).bind(eventId).run();
+    return json({ received: true });
+  } catch (err) {
+    await env.DB.prepare(
+      "UPDATE billing_webhook_events SET processing_status = 'failed' WHERE event_id = ? AND processing_status = 'processing'",
+    ).bind(eventId).run();
+    return json({ error: `Could not process Waffo event: ${String((err as Error)?.message || err)}` }, 500);
+  }
+}
+
+function htmlPage(saasMode = false, googleLoginEnabled = false): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -753,7 +1090,52 @@ function htmlPage(): string {
       background: rgba(255, 255, 255, 0.18);
       backdrop-filter: blur(10px);
     }
-    table.files-table { min-width: 860px; }
+    .files-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .files-search { flex: 1 1 260px; max-width: 420px; }
+    .files-search input {
+      width: 100%;
+      min-width: 0;
+      padding: 10px 14px;
+      background: rgba(255, 255, 255, 0.58);
+    }
+    .files-count, .files-page-info { color: #53627b; font-size: 14px; }
+    .files-bulk-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: -4px;
+    }
+    .files-bulk-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .files-bulk-toolbar .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+    .files-pagination {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .files-pagination .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+      pointer-events: none;
+    }
+    table.files-table { width: 100%; min-width: 900px; table-layout: fixed; }
+    .files-table .file-col-select { width: 44px; }
+    .files-table .file-col-note { width: 180px; }
+    .files-table .file-col-size { width: 80px; }
+    .files-table .file-col-uploaded,
+    .files-table .file-col-expiration { width: 110px; }
+    .files-table .file-col-downloads { width: 100px; }
+    .files-table .file-col-actions { width: 230px; }
     th, td {
       text-align: left;
       border-bottom: 1px solid rgba(145, 158, 185, 0.25);
@@ -762,18 +1144,44 @@ function htmlPage(): string {
     }
     th { color: #43536f; font-weight: 700; font-size: 14px; }
     td.actions { white-space: nowrap; text-align: right; }
+    .files-table .file-select-cell { text-align: center; }
+    .file-select-checkbox {
+      width: 16px;
+      height: 16px;
+      min-width: 16px;
+      min-height: 16px;
+      margin: 0;
+      padding: 0;
+      accent-color: var(--primary);
+      cursor: pointer;
+    }
     .actions .btn { margin-left: 8px; }
+    .files-table td.actions .btn.small {
+      min-width: 36px;
+      min-height: 34px;
+      margin-left: 4px;
+      padding: 0 6px;
+    }
+    .files-table td.actions .btn.danger.small { min-width: 64px; }
+    .files-table .note-cell {
+      max-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .file-cell {
       display: inline-flex;
       align-items: center;
       gap: 10px;
+      width: 100%;
       min-width: 0;
     }
     .file-name {
+      flex: 1;
+      min-width: 0;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 280px;
       display: inline-block;
     }
     .file-icon {
@@ -922,6 +1330,34 @@ function htmlPage(): string {
       box-shadow: var(--shadow);
       backdrop-filter: blur(22px) saturate(130%);
     }
+    #auth-loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 13px;
+      max-width: 420px;
+      min-height: 76px;
+      margin: 28vh auto 0;
+      padding: 18px 22px;
+      border: 1px solid rgba(255, 255, 255, 0.78);
+      border-radius: 16px;
+      color: #53627b;
+      background: rgba(255, 255, 255, 0.72);
+      box-shadow: 0 14px 40px rgba(66, 82, 130, 0.12);
+      backdrop-filter: blur(16px);
+    }
+    .auth-loading-spinner {
+      flex: 0 0 22px;
+      width: 22px;
+      height: 22px;
+      border: 3px solid rgba(81, 107, 215, 0.2);
+      border-top-color: #526bd7;
+      border-radius: 50%;
+      animation: auth-spin 0.8s linear infinite;
+    }
+    #auth-loading-message { margin: 0; }
+    #auth-retry { margin-left: auto; }
+    @keyframes auth-spin { to { transform: rotate(360deg); } }
     #login h1 { font-size: 46px; margin: 0 0 8px; text-align: center; }
     #login .auth-sub { margin: 0 0 18px; text-align: center; color: #75829a; font-size: 14px; }
     #login .btn { justify-content: center; border-radius: 12px; min-width: 180px; }
@@ -940,6 +1376,7 @@ function htmlPage(): string {
       .row { gap: 8px; }
       .drop { width: 100%; }
       .actions .btn { margin-left: 0; }
+      .files-table td.actions .btn.small { margin-left: 0; }
       .drop-primary { font-size: 16px; }
       td.actions {
         display: flex;
@@ -947,13 +1384,202 @@ function htmlPage(): string {
         flex-wrap: wrap;
         justify-content: flex-end;
       }
-      table.files-table { min-width: 700px; }
-      .file-name { max-width: 180px; }
+      table.files-table { min-width: 820px; }
+      .files-table .file-col-note { width: 140px; }
+      .files-table .file-col-size { width: 60px; }
+      .files-table .file-col-uploaded,
+      .files-table .file-col-expiration { width: 90px; }
+      .files-table .file-col-downloads { width: 80px; }
+      .files-table .file-col-actions { width: 200px; }
+      .files-toolbar { align-items: stretch; }
+      .files-search { flex-basis: 100%; max-width: none; }
+      .files-count { width: 100%; }
+      .files-pagination { justify-content: space-between; gap: 8px; }
+      .files-pagination .btn.small { min-width: 76px; }
+    }
+
+    /* Shared Notion-inspired visual language used by the public home page. */
+    :root {
+      --bg: #f6f5f4;
+      --bg-2: #f6f5f4;
+      --glass: #ffffff;
+      --glass-strong: #ffffff;
+      --text: #111111;
+      --muted: #615d59;
+      --line: rgba(0,0,0,.08);
+      --shadow: 0 4px 12px rgba(0,0,0,.1);
+      --primary: #0075de;
+      --accent: #0075de;
+      --danger: #f64932;
+      --blue: #0075de;
+    }
+    body { padding: 0; color: #111; background: #f6f5f4; font: 16px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .shell { width: 100%; max-width: 1328px; min-height: 100vh; }
+    .topbar { padding: 16px 24px; }
+    main { padding: 12px 24px 40px; }
+    .flash { margin-left: 24px; margin-right: 24px; }
+    .brand { display: flex; align-items: center; gap: 9px; color: #111; font-size: 18px; font-weight: 650; letter-spacing: -.04em; }
+    .brand-icon { display: block; width: 28px; height: 28px; object-fit: contain; }
+    .nav button:not(.btn):not(.nav-upload), .sys-toggle { color: #615d59; border-radius: 8px; }
+    .nav button:not(.btn):not(.nav-upload)[aria-current="page"], .sys-toggle.active { color: #0075de; background: #e6f3fe; }
+    .nav button:not(.btn):not(.nav-upload):hover, .sys-toggle:hover { color: #0075de; background: #e6f3fe; transform: none; }
+    .nav button.nav-upload { color: #fff; background: #0075de; border-color: #0075de; border-radius: 8px; }
+    .nav button.nav-upload:hover { background: #0068c7; transform: none; }
+    .nav button.nav-upload[aria-current="page"] { color: #fff; background: #0075de; }
+    .nav button.nav-upload > svg { color: #fff; }
+    .system-menu { background: #fff; border-color: rgba(0,0,0,.08); border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.1); backdrop-filter: none; }
+    .system-menu button { color: #111; }
+    .system-menu button:hover { background: #e6f3fe; }
+    main { padding-top: 12px; }
+    h1, h2, h3 { color: #111; letter-spacing: -.035em; font-weight: 600; }
+    h1 { font-size: clamp(40px,4vw,48px); line-height: 1.08; }
+    h2 { font-size: clamp(28px,3vw,36px); line-height: 1.15; }
+    h3 { font-size: clamp(20px,2.2vw,24px); line-height: 1.25; }
+    .muted, .small { color: #615d59; }
+    .stack-wide, .upload-grid { max-width: 1280px; }
+    label { color: #615d59; }
+    input, select, textarea { color: #111; border-color: rgba(0,0,0,.16); border-radius: 8px; background: #fff; backdrop-filter: none; }
+    input:focus, select:focus, textarea:focus { border-color: #0075de; box-shadow: 0 0 0 3px rgba(0,117,222,.12); }
+    .btn { --btn-color: #0075de; color: #0075de; border-radius: 8px; transition: color .2s ease, background-color .2s ease, border-color .2s ease; }
+    .btn:hover { color: #fff; border-color: #0075de; }
+    .btn::before { background: #0075de; transition: transform .2s ease; }
+    .btn.blue { --btn-color: #0075de; }
+    .btn.danger { --btn-color: #f64932; }
+    .btn.small { border-radius: 8px; }
+    .drop { border-color: rgba(0,0,0,.2); border-radius: 12px; background: #fff; }
+    .drop:hover, .drop.dragover { border-color: #0075de; background: #e6f3fe; box-shadow: none; }
+    .drop-primary { color: #111; }
+    .drop-secondary { color: #615d59; }
+    .drop-file { color: #0075de; }
+    .note-box { color: #111; border-left-color: #0075de; border-radius: 8px; background: #e6f3fe; }
+    .panel { border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; backdrop-filter: none; }
+    .file-info-page { width: 100%; max-width: 1280px; min-width: 0; }
+    .file-info-page .file-links, .file-info-page .versions-panel { width: 100%; max-width: none; min-width: 0; }
+    .file-info-page .file-links .row { align-items: stretch; }
+    .file-info-page .file-links .row a { flex: 1 1 320px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+    .file-meta-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; max-width: none; min-width: 0; }
+    .file-meta-item { min-width: 0; padding: 14px 16px; border: 1px solid rgba(0,0,0,.08); border-radius: 8px; background: #fff; }
+    .file-meta-item > strong { display: block; margin-bottom: 6px; color: #615d59; font-size: 13px; }
+    .file-meta-value { display: block; min-width: 0; color: #111; line-height: 1.5; overflow-wrap: anywhere; word-break: break-word; }
+    .file-meta-downloads .file-meta-value { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    table.version-history-table { width: 100%; min-width: 0; table-layout: fixed; }
+    .version-history-table th, .version-history-table td { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+    .version-history-table th:nth-child(1), .version-history-table td:nth-child(1) { width: 10%; }
+    .version-history-table th:nth-child(2), .version-history-table td:nth-child(2) { width: 14%; }
+    .version-history-table th:nth-child(3), .version-history-table td:nth-child(3) { width: 28%; }
+    .version-history-table th:nth-child(4), .version-history-table td:nth-child(4) { width: 32%; }
+    .version-history-table th:nth-child(5), .version-history-table td:nth-child(5) { width: 16%; }
+    .version-history-table .version-md5 { font-size: 12px; word-break: break-all; }
+    .version-history-table .version-time { font-size: 13px; }
+    .version-history-table td.version-actions { text-align: right; white-space: nowrap; }
+    .check-row label, .toggle-row label, .days-row span { color: #615d59; }
+    table, .table-wrap { background: #fff; }
+    .table-wrap { border-color: rgba(0,0,0,.08); border-radius: 12px; backdrop-filter: none; }
+    .files-search input { background: #fff; }
+    .files-count, .files-page-info { color: #615d59; }
+    th, td { border-bottom-color: rgba(0,0,0,.08); }
+    th { color: #615d59; }
+    .file-icon { box-shadow: none; }
+    .file-icon.type-image { background: #097fe8; }
+    .file-icon.type-pdf { background: #f64932; }
+    .file-icon.type-text { background: #ffb110; }
+    .file-icon.type-video { background: #02093a; }
+    .file-icon.type-audio { background: #62aef0; }
+    .file-icon.type-archive { background: #b18164; }
+    .file-icon.type-code { background: #0075de; }
+    .file-icon.type-other { background: #757575; }
+    .file-preview { border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; box-shadow: 0 4px 12px rgba(0,0,0,.1); backdrop-filter: none; }
+    .file-preview-title { color: #615d59; border-bottom-color: rgba(0,0,0,.08); background: #fff; }
+    .file-preview img { background: #f6f5f4; }
+    .flash { border-radius: 8px; background: #fff; backdrop-filter: none; }
+    .flash.ok { background: #e6f3fe; border-color: rgba(0,117,222,.22); color: #111; }
+    .flash.err { background: #fff0ed; border-color: rgba(246,73,50,.3); color: #9e2416; }
+    .busy-card { color: #111; border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; box-shadow: 0 4px 12px rgba(0,0,0,.1); }
+    .busy-spinner { border-color: rgba(0,117,222,.18); border-top-color: #0075de; }
+    .modal { border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; box-shadow: 0 4px 12px rgba(0,0,0,.1); backdrop-filter: none; }
+    .modal p { color: #615d59; }
+    .bar { background: #e6f3fe; }
+    .bar > span { background: #0075de; }
+    #login { border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; box-shadow: none; backdrop-filter: none; }
+    #login .auth-sub { color: #615d59; }
+    #auth-loading { color: #615d59; border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; box-shadow: none; backdrop-filter: none; }
+    .auth-loading-spinner { border-color: rgba(0,117,222,.18); border-top-color: #0075de; }
+    #login .btn { border-radius: 8px; }
+    #login .google-login-button {
+      align-self: center;
+      min-width: 114px;
+      min-height: 42px;
+      padding: 0 16px;
+      gap: 8px;
+      border: 1px solid #e2e2e2;
+      border-radius: 10px;
+      background: #f7f7f7;
+      color: #1f1f1f;
+      font-size: 14px;
+      font-weight: 500;
+      line-height: 20px;
+      box-shadow: none;
+    }
+    #login .google-login-button::before { display: none; }
+    #login .google-login-button:hover {
+      transform: none;
+      border-color: #d5d5d5;
+      background: #f1f1f1;
+      color: #1f1f1f;
+    }
+    .google-login-icon { display: block; width: 18px; height: 18px; flex: none; }
+    @media (max-width: 980px) {
+      body { padding: 0; }
+      .topbar, main { padding-left: 16px; padding-right: 16px; }
+      .flash { margin-left: 16px; margin-right: 16px; }
+      .topbar { padding-top: 12px; padding-bottom: 12px; }
+      .file-meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .topbar { align-items: stretch; flex-direction: column; gap: 8px; }
+      .topbar > .row:first-child { width: 100%; align-items: stretch; flex-direction: column; gap: 8px !important; }
+      .topbar .nav { width: 100%; min-width: 0; flex-wrap: nowrap; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+      .topbar .nav button { flex: 0 0 auto; white-space: nowrap; }
+      .topbar .nav button.nav-upload { min-width: 0; padding: 0 10px; }
+      .topbar .nav button.nav-upload > svg { width: 20px; height: 20px; margin-left: 2px; }
+      .topbar .top-right { align-self: flex-end; }
+      .file-info-page .file-links .row { align-items: stretch; flex-direction: column; }
+      .file-info-page .file-links .row a { flex-basis: auto; }
+      .file-meta-grid { grid-template-columns: minmax(0, 1fr); }
+      .file-info-page > .submit-row { align-items: stretch; flex-direction: column; }
+      .file-info-page > .submit-row .btn { width: 100%; }
+      .version-history-table { display: block; }
+      .version-history-table thead { display: none; }
+      .version-history-table tbody { display: grid; gap: 10px; padding: 10px; }
+      .version-history-table tbody tr { display: grid; grid-template-columns: minmax(0, 1fr); border: 1px solid rgba(0,0,0,.08); border-radius: 8px; }
+      .version-history-table tbody td { display: flex; min-width: 0; flex-direction: column; gap: 4px; border: 0; padding: 10px; }
+      .version-history-table tbody td:nth-child(n) { width: auto; }
+      .version-history-table tbody td::before { content: attr(data-label); color: #615d59; font-size: 12px; font-weight: 600; }
+      .version-history-table tbody td.version-actions { grid-column: 1 / -1; align-items: flex-start; text-align: left; }
+      body { font-size: 16px; line-height: 1.55; }
+      h1, #login h1 { font-size: clamp(30px, 8vw, 38px); line-height: 1.12; }
+      h2 { font-size: clamp(23px, 6vw, 28px); line-height: 1.2; }
+      h3 { font-size: 19px; line-height: 1.3; }
+      label, input, select, textarea, .btn, table, .file-meta-value { font-size: 15px; }
+      .small, .file-meta-item > strong, .admin-row-meta, .version-history-table .version-time { font-size: 14px; }
+      .file-preview-title, .flash, .modal p, #auth-loading-message, #login .auth-sub { font-size: 15px; }
+      .file-info-page .submit-row .btn { min-height: 44px; }
+      .version-history-table .version-md5 { font-size: 13px; }
+    }
+    @media (max-width: 360px) {
+      h1 { font-size: 29px; }
+      h2 { font-size: 22px; }
+      .topbar, main { padding-left: 12px; padding-right: 12px; }
     }
   </style>
 </head>
 <body>
-  <section id="login" aria-labelledby="login-title">
+  <section id="auth-loading" class="${saasMode ? "" : "hidden"}" role="status" aria-live="polite" aria-busy="true">
+    <span class="auth-loading-spinner" aria-hidden="true"></span>
+    <p id="auth-loading-message">Restoring your session…</p>
+    <button id="auth-retry" class="btn blue small hidden" type="button">Try again</button>
+  </section>
+  <section id="login" class="${saasMode ? "hidden" : ""}" aria-labelledby="login-title">
     <h1 id="login-title">Welcome Back</h1>
     <p id="login-subtitle" class="auth-sub">Sign in to your account to continue</p>
     <div class="stack">
@@ -962,14 +1588,33 @@ function htmlPage(): string {
         <input id="pw" type="password" autocomplete="current-password" placeholder="Enter your passphrase" />
       </div>
       <button class="btn form-submit" id="login-btn" type="button">Sign In</button>
+      <button class="btn google-login-button" id="google-login-btn" type="button" aria-label="Continue with Google" style="display:none"><svg class="google-login-icon" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.75 7.18l7.73 6C44.42 37.85 46.98 31.7 46.98 24.55z"/><path fill="#FBBC05" d="M10.53 28.59A14.4 14.4 0 0 1 9.75 24c0-1.59.27-3.13.76-4.59l-7.98-6.19A23.9 23.9 0 0 0 0 24c0 3.87.93 7.52 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.91-5.8l-7.73-6c-2.15 1.45-4.9 2.3-8.18 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg><span>Google</span></button>
+      <form id="saas-email-auth-form" class="stack" style="display:none">
+        <div id="saas-name-field" style="display:none">
+          <label id="saas-name-label" for="saas-name">Name</label>
+          <input id="saas-name" type="text" maxlength="80" autocomplete="name" />
+        </div>
+        <div>
+          <label id="saas-email-label" for="saas-email">Email</label>
+          <input id="saas-email" type="email" maxlength="254" autocomplete="email" required />
+        </div>
+        <div>
+          <label id="saas-password-label" for="saas-password">Password</label>
+          <input id="saas-password" type="password" minlength="8" maxlength="128" autocomplete="current-password" required />
+        </div>
+        <button class="btn form-submit" id="saas-email-submit" type="submit">Sign in with email</button>
+        <button class="btn form-submit" id="saas-email-mode-toggle" type="button">Create an account</button>
+        <p id="saas-email-help" class="small"></p>
+      </form>
       <p id="login-help" class="small">Authentication uses the shared secret configured on the worker.</p>
+      <p id="saas-email-error" class="small" role="status" aria-live="polite" style="color:var(--danger)"></p>
     </div>
   </section>
 
   <div id="app" class="shell hidden">
     <header class="topbar">
       <div class="row" style="gap: 26px;">
-        <div class="brand">PicoShare</div>
+        <div class="brand"><img class="brand-icon" src="/favicon.svg" alt="" />PicoShare</div>
         <nav class="nav" aria-label="Primary">
           <button type="button" class="nav-upload" data-view="upload" aria-current="page">
             <span id="nav-upload-text">Upload</span>
@@ -1001,6 +1646,7 @@ function htmlPage(): string {
           </button>
         </div>
         <div id="system-menu" class="system-menu" role="menu" aria-label="System pages">
+          <button type="button" id="menu-account" role="menuitem" style="display:none">账户与订阅</button>
           <button id="menu-system-info" type="button" data-view="systemInfo" role="menuitem">System Information</button>
           <button id="menu-settings" type="button" data-view="settings" role="menuitem">Settings</button>
           <button type="button" id="logout-btn" role="menuitem">Logout</button>
@@ -1034,14 +1680,19 @@ function htmlPage(): string {
 
   <script>
     (function() {
+      var PS_SAAS_MODE = ${saasMode ? "true" : "false"};
+      var PS_GOOGLE_LOGIN_ENABLED = ${googleLoginEnabled ? "true" : "false"};
       var state = {
         pw: localStorage.getItem('ps_pw') || '',
         view: 'upload',
         selectedId: null,
         files: [],
         guestLinks: [],
-        settings: { storeForever: true, defaultDays: 30 },
+          settings: { storeForever: true, defaultDays: PS_SAAS_MODE ? 365 : 30 },
+        planLimits: null,
         downloadsUniqueOnly: false,
+        fileSearch: '',
+        filePage: 1,
         lang: localStorage.getItem('ps_lang') === 'zh' ? 'zh' : 'en',
       };
       var multipartUploadThresholdBytes = ${MULTIPART_UPLOAD_THRESHOLD_BYTES};
@@ -1050,10 +1701,26 @@ function htmlPage(): string {
         en: {
           login_title: 'Welcome Back',
           login_subtitle: 'Sign in to your account to continue',
+          auth_loading: 'Restoring your session…',
+          auth_loading_error: 'Could not restore your session. Check your connection and try again.',
+          retry: 'Try again',
           passphrase: 'Passphrase',
           passphrase_placeholder: 'Enter your passphrase',
           sign_in: 'Sign In',
           login_help: 'Authentication uses the shared secret configured on the worker.',
+          email: 'Email',
+          name: 'Name',
+          password: 'Password',
+          email_placeholder: 'name@example.com',
+          email_sign_in: 'Sign in with email',
+          email_sign_up: 'Create account',
+          google_login_aria: 'Continue with Google',
+          email_switch_to_sign_up: 'Create an account',
+          email_switch_to_sign_in: 'Already registered? Sign in',
+          saas_login_help: 'Sign in with your email and password or Google account.',
+          saas_email_help: 'Password must be at least 8 characters. Email verification and password reset are not configured.',
+          saas_signin_required: 'Please sign in with email or Google first.',
+          email_auth_failed: 'Email authentication failed.',
           nav_upload: 'Upload',
           nav_files: 'Files',
           nav_clips: 'Clips',
@@ -1072,8 +1739,13 @@ function htmlPage(): string {
           logged_out: 'Logged out.',
           upload: 'Upload',
           drop_choose: 'Drop files here or click to choose',
-          supports_drag: 'Supports drag and drop upload',
+          choose_files: 'Choose files',
+          supports_drag: 'Choose or drop multiple files at once',
           no_file_selected: 'No file selected',
+          selected_files_count: '{count} files selected',
+          batch_upload_progress: 'Uploading file {current} of {total}...',
+          batch_upload_success: 'Uploaded {count} files.',
+          batch_upload_partial: 'Uploaded {uploaded} of {total} files. Failed files remain selected; submit again to retry.',
           or_paste_here: 'Or paste something here',
           paste_placeholder: 'Paste text content to upload as .txt',
           expiration: 'Expiration',
@@ -1081,13 +1753,32 @@ function htmlPage(): string {
           day_7: '7 days',
           day_30: '30 days',
           day_90: '90 days',
+          day_365: '365 days',
           never: 'Never',
+          retention_plan_help: 'Pro defaults to 365 days. Enable permanent storage to use no expiration for new uploads.',
           note_optional: 'Note (optional)',
           note_placeholder: 'For Joe at ExampleCo',
           note_only_you: 'Note is only visible to you',
           upload_success: 'Upload succeeded.',
           select_or_paste_first: 'Select a file or paste text first.',
           files: 'Files',
+          files_search: 'Search files',
+          files_search_placeholder: 'Search by filename or note',
+          files_count: '{count} files',
+          select_all_files_page: 'Select all files on this page',
+          select_file: 'Select {name}',
+          files_selected_count: '{count} selected',
+          delete_selected_files: 'Delete selected',
+          delete_selected_files_confirm: 'Delete {count} selected files? This cannot be undone.',
+          files_deleted_count: 'Deleted {count} files.',
+          files_delete_partial: 'Deleted {deleted} files; {failed} failed.',
+          copy_selected_file_links: 'Copy selected links',
+          selected_file_links_copied: 'Copied {count} file links.',
+          files_page_info: 'Page {page} of {pages}',
+          previous_page: 'Previous',
+          next_page: 'Next',
+          no_files_in_list: 'No files uploaded yet.',
+          no_matching_files: 'No files match your search.',
           filename: 'Filename',
           note: 'Note',
           size: 'Size',
@@ -1116,6 +1807,7 @@ function htmlPage(): string {
           update_file_title: 'Update File Content',
           update_same_name_hint: 'Choose a replacement file with the same filename. The existing link will stay unchanged.',
           choose_update_file: 'Choose replacement file',
+          select_one_update_file: 'Choose one replacement file at a time.',
           same_name_required: 'The replacement file must keep the same filename.',
           delete_after_expiration: 'Delete after expiration',
           save: 'Save',
@@ -1182,10 +1874,26 @@ function htmlPage(): string {
         zh: {
           login_title: '欢迎回来',
           login_subtitle: '登录后继续使用',
+          auth_loading: '正在恢复登录状态…',
+          auth_loading_error: '暂时无法确认登录状态，请检查网络后重试。',
+          retry: '重试',
           passphrase: '访问口令',
           passphrase_placeholder: '请输入访问口令',
           sign_in: '登录',
           login_help: '认证使用 Worker 配置的共享密钥。',
+          email: '邮箱',
+          name: '姓名',
+          password: '密码',
+          email_placeholder: 'name@example.com',
+          email_sign_in: '邮箱登录',
+          email_sign_up: '创建账号',
+          google_login_aria: '使用 Google 登录',
+          email_switch_to_sign_up: '注册新账号',
+          email_switch_to_sign_in: '已有账号？去登录',
+          saas_login_help: '使用邮箱密码或 Google 账号登录。',
+          saas_email_help: '密码至少 8 位。邮箱验证和密码找回邮件暂未配置。',
+          saas_signin_required: '请先使用邮箱或 Google 登录。',
+          email_auth_failed: '邮箱登录失败。',
           nav_upload: '上传',
           nav_files: '文件',
           nav_clips: '云便签',
@@ -1204,8 +1912,13 @@ function htmlPage(): string {
           logged_out: '已退出登录。',
           upload: '上传',
           drop_choose: '拖拽文件到这里，或点击选择',
-          supports_drag: '支持拖拽上传',
+          choose_files: '选择文件',
+          supports_drag: '支持一次拖拽或选择多个文件',
           no_file_selected: '未选择文件',
+          selected_files_count: '已选择 {count} 个文件',
+          batch_upload_progress: '正在上传第 {current} / {total} 个文件…',
+          batch_upload_success: '成功上传 {count} 个文件。',
+          batch_upload_partial: '已上传 {uploaded} / {total} 个文件。失败的文件仍保留在选择列表中，可再次提交重试。',
           or_paste_here: '或者在这里粘贴内容',
           paste_placeholder: '粘贴文本后将保存为 .txt 文件',
           expiration: '过期时间',
@@ -1213,13 +1926,32 @@ function htmlPage(): string {
           day_7: '7 天',
           day_30: '30 天',
           day_90: '90 天',
+          day_365: '365 天',
           never: '永不过期',
+          retention_plan_help: 'Pro 默认保存 365 天；开启永久保存后，新上传文件不设过期时间。',
           note_optional: '备注（可选）',
           note_placeholder: '例如：给某同事',
           note_only_you: '备注仅自己可见',
           upload_success: '上传成功。',
           select_or_paste_first: '请先选择文件或粘贴内容。',
           files: '文件',
+          files_search: '搜索文件',
+          files_search_placeholder: '按文件名或备注搜索',
+          files_count: '共 {count} 个文件',
+          select_all_files_page: '全选本页文件',
+          select_file: '选择文件 {name}',
+          files_selected_count: '已选择 {count} 个',
+          delete_selected_files: '批量删除',
+          delete_selected_files_confirm: '确认删除选中的 {count} 个文件吗？删除后无法恢复。',
+          files_deleted_count: '已删除 {count} 个文件。',
+          files_delete_partial: '已删除 {deleted} 个文件，{failed} 个失败。',
+          copy_selected_file_links: '复制选中文件链接',
+          selected_file_links_copied: '已复制 {count} 个文件链接。',
+          files_page_info: '第 {page} / {pages} 页',
+          previous_page: '上一页',
+          next_page: '下一页',
+          no_files_in_list: '还没有上传文件。',
+          no_matching_files: '没有找到匹配的文件。',
           filename: '文件名',
           note: '备注',
           size: '大小',
@@ -1248,6 +1980,7 @@ function htmlPage(): string {
           update_file_title: '更新文件内容',
           update_same_name_hint: '请选择同名替换文件，原有链接地址保持不变。',
           choose_update_file: '选择替换文件',
+          select_one_update_file: '每次请只选择或拖入一个替换文件。',
           same_name_required: '替换文件必须保持相同文件名。',
           delete_after_expiration: '到期后自动删除',
           save: '保存',
@@ -1319,12 +2052,16 @@ function htmlPage(): string {
       }
 
       var loginEl = document.getElementById('login');
+      var authLoadingEl = document.getElementById('auth-loading');
+      var authLoadingMessage = document.getElementById('auth-loading-message');
+      var authRetryButton = document.getElementById('auth-retry');
       var appEl = document.getElementById('app');
       var mainEl = document.getElementById('main');
       var flashEl = document.getElementById('flash');
       var flashTimer = null;
       var pwEl = document.getElementById('pw');
       var loginBtn = document.getElementById('login-btn');
+      var saasEmailMode = 'sign-in';
       var systemToggle = document.getElementById('system-toggle');
       var systemMenu = document.getElementById('system-menu');
       var confirmBackdrop = document.getElementById('confirm-backdrop');
@@ -1338,14 +2075,32 @@ function htmlPage(): string {
       var busyText = document.getElementById('busy-text');
       var langToggle = document.getElementById('lang-toggle');
 
+      function renderSaasEmailMode() {
+        var registering = saasEmailMode === 'sign-up';
+        document.getElementById('saas-name-field').style.display = registering ? 'block' : 'none';
+        document.getElementById('saas-name').required = registering;
+        document.getElementById('saas-password').setAttribute('autocomplete', registering ? 'new-password' : 'current-password');
+        document.getElementById('saas-email-submit').textContent = t(registering ? 'email_sign_up' : 'email_sign_in');
+        document.getElementById('saas-email-mode-toggle').textContent = t(registering ? 'email_switch_to_sign_in' : 'email_switch_to_sign_up');
+      }
+
       function applyStaticTranslations() {
         document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'en';
         document.getElementById('login-title').textContent = t('login_title');
         document.getElementById('login-subtitle').textContent = t('login_subtitle');
+        authLoadingMessage.textContent = t('auth_loading');
+        authRetryButton.textContent = t('retry');
         document.getElementById('pw-label').textContent = t('passphrase');
         pwEl.setAttribute('placeholder', t('passphrase_placeholder'));
         loginBtn.textContent = t('sign_in');
+        document.getElementById('google-login-btn').setAttribute('aria-label', t('google_login_aria'));
         document.getElementById('login-help').textContent = t('login_help');
+        document.getElementById('saas-name-label').textContent = t('name');
+        document.getElementById('saas-email-label').textContent = t('email');
+        document.getElementById('saas-email').setAttribute('placeholder', t('email_placeholder'));
+        document.getElementById('saas-password-label').textContent = t('password');
+        document.getElementById('saas-email-help').textContent = t('saas_email_help');
+        renderSaasEmailMode();
         document.getElementById('nav-upload-text').textContent = t('nav_upload');
         document.getElementById('nav-files-btn').textContent = t('nav_files');
         document.getElementById('nav-clips-btn').textContent = t('nav_clips');
@@ -1537,7 +2292,7 @@ function htmlPage(): string {
 
       function authHeaders(extra) {
         var h = Object.assign({}, extra || {});
-        h.Authorization = state.pw;
+        if (!PS_SAAS_MODE) h.Authorization = state.pw;
         return h;
       }
 
@@ -1695,7 +2450,46 @@ function htmlPage(): string {
         systemToggle.setAttribute('aria-expanded', 'true');
       }
 
+      async function submitSaasEmailAuth(evt) {
+        evt.preventDefault();
+        var errorEl = document.getElementById('saas-email-error');
+        errorEl.textContent = '';
+        var registering = saasEmailMode === 'sign-up';
+        var payload = {
+          email: document.getElementById('saas-email').value.trim(),
+          password: document.getElementById('saas-password').value,
+          callbackURL: '/app',
+        };
+        if (registering) payload.name = document.getElementById('saas-name').value.trim();
+        try {
+          var response = await fetch(registering ? '/api/auth/sign-up/email' : '/api/auth/sign-in/email', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          var data = await response.json().catch(function() { return {}; });
+          if (!response.ok) throw new Error(data.message || data.error || t('email_auth_failed'));
+          location.href = '/app';
+        } catch (err) {
+          errorEl.textContent = String((err && err.message) || err || t('email_auth_failed'));
+        }
+      }
+
       async function login() {
+        if (PS_SAAS_MODE) {
+          try {
+            await api('/api/entries');
+            setFlash('', false);
+            loginEl.classList.add('hidden');
+            appEl.classList.remove('hidden');
+            await loadInitialData();
+            await render();
+          } catch (_) {
+            setFlash(t('saas_signin_required'), true);
+          }
+          return;
+        }
         state.pw = (pwEl.value || state.pw || '').trim();
         if (!state.pw) {
           setFlash(t('please_enter_passphrase'), true);
@@ -1715,6 +2509,15 @@ function htmlPage(): string {
       }
 
       function logout() {
+        if (PS_SAAS_MODE) {
+          fetch('/api/auth/sign-out', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+          }).finally(function() { location.href = '/'; });
+          return;
+        }
         localStorage.removeItem('ps_pw');
         state.pw = '';
         state.selectedId = null;
@@ -1725,14 +2528,47 @@ function htmlPage(): string {
         setFlash(t('logged_out'), false);
       }
 
+      async function restoreSaasSession() {
+        authLoadingEl.classList.remove('hidden');
+        authLoadingEl.setAttribute('aria-busy', 'true');
+        authLoadingMessage.textContent = t('auth_loading');
+        authRetryButton.classList.add('hidden');
+        loginEl.classList.add('hidden');
+        appEl.classList.add('hidden');
+        try {
+          var response = await fetch('/api/session', { credentials: 'same-origin', cache: 'no-store' });
+          if (!response.ok) throw new Error('Session request failed: ' + response.status);
+          var session = await response.json();
+          if (!session.user) {
+            authLoadingEl.classList.add('hidden');
+            authLoadingEl.setAttribute('aria-busy', 'false');
+            loginEl.classList.remove('hidden');
+            return;
+          }
+          await loadInitialData();
+          render();
+          authLoadingEl.classList.add('hidden');
+          authLoadingEl.setAttribute('aria-busy', 'false');
+          loginEl.classList.add('hidden');
+          appEl.classList.remove('hidden');
+        } catch (_) {
+          authLoadingMessage.textContent = t('auth_loading_error');
+          authLoadingEl.setAttribute('aria-busy', 'false');
+          authRetryButton.classList.remove('hidden');
+        }
+      }
+
       async function loadInitialData() {
-        var loaded = await Promise.all([api('/api/entries'), api('/api/guest-links'), api('/api/settings')]);
+        var requests = [api('/api/entries'), api('/api/guest-links'), api('/api/settings')];
+        if (PS_SAAS_MODE) requests.push(api('/api/account'));
+        var loaded = await Promise.all(requests);
         state.files = loaded[0];
         state.guestLinks = loaded[1];
         state.settings = {
           storeForever: !!loaded[2].storeForever,
           defaultDays: Number(loaded[2].defaultDays || 30),
         };
+        state.planLimits = PS_SAAS_MODE ? loaded[3].limits : null;
       }
 
       async function refreshFiles() {
@@ -1746,22 +2582,38 @@ function htmlPage(): string {
       function createUploadView() {
         var form = el('form', { class: 'upload-grid' });
 
-        var fileInput = el('input', { type: 'file', id: 'upload-file', 'aria-label': 'Choose file', class: 'hidden' });
+        var fileInput = el('input', { type: 'file', id: 'upload-file', multiple: true, 'aria-label': t('choose_files'), class: 'hidden' });
         var dropFileName = el('div', { class: 'drop-file', text: t('no_file_selected') });
         var drop = el('button', { type: 'button', class: 'drop', onclick: function() { fileInput.click(); } }, [
           el('div', { class: 'drop-primary', text: t('drop_choose') }),
           el('div', { class: 'drop-secondary', text: t('supports_drag') }),
           dropFileName,
         ]);
-        var selectedFile = null;
+        var selectedFiles = [];
 
-        function setSelectedFile(file) {
-          selectedFile = file || null;
-          dropFileName.textContent = selectedFile ? (t('selected_prefix') + ': ' + selectedFile.name) : t('no_file_selected');
+        function selectedFilesSummary() {
+          if (!selectedFiles.length) return t('no_file_selected');
+          var names = selectedFiles.slice(0, 3).map(function(file) { return file.name; }).join(', ');
+          if (selectedFiles.length > 3) names += ' +' + String(selectedFiles.length - 3);
+          return t('selected_files_count').replace('{count}', String(selectedFiles.length)) + ': ' + names;
+        }
+
+        function setSelectedFiles(files, append) {
+          var nextFiles = append ? selectedFiles.slice() : [];
+          for (var i = 0; files && i < files.length; i += 1) {
+            var file = files[i];
+            var duplicate = nextFiles.some(function(existing) {
+              return existing.name === file.name && existing.size === file.size && existing.lastModified === file.lastModified;
+            });
+            if (!duplicate) nextFiles.push(file);
+          }
+          selectedFiles = nextFiles;
+          dropFileName.textContent = selectedFilesSummary();
         }
 
         fileInput.addEventListener('change', function() {
-          setSelectedFile(fileInput.files && fileInput.files[0] ? fileInput.files[0] : null);
+          setSelectedFiles(fileInput.files, false);
+          fileInput.value = '';
         });
 
         ['dragenter', 'dragover'].forEach(function(type) {
@@ -1781,7 +2633,7 @@ function htmlPage(): string {
           drop.classList.remove('dragover');
           var files = evt.dataTransfer && evt.dataTransfer.files;
           if (files && files.length > 0) {
-            setSelectedFile(files[0]);
+            setSelectedFiles(files, true);
           }
         });
 
@@ -1789,15 +2641,20 @@ function htmlPage(): string {
         var paste = el('textarea', { id: 'paste', placeholder: t('paste_placeholder') });
 
         var expLabel = el('label', { for: 'exp-select', text: t('expiration') });
-        var expSelect = el('select', { id: 'exp-select' }, [
-          el('option', { value: '0', text: t('never') }),
-          el('option', { value: '1', text: t('day_1') }),
-          el('option', { value: '7', text: t('day_7') }),
-          el('option', { value: '30', text: t('day_30') }),
-          el('option', { value: '90', text: t('day_90') }),
-        ]);
-        if (!state.settings.storeForever) {
-          expSelect.value = String(Math.max(1, state.settings.defaultDays || 30));
+        var maxRetentionDays = Number(state.planLimits && state.planLimits.maxFileLifetimeDays) || 3650;
+        var expirationOptions = [];
+        if (!PS_SAAS_MODE || (PS_SAAS_MODE && state.planLimits && state.planLimits.maxFileLifetimeDays > 30)) {
+          expirationOptions.push(el('option', { value: '0', text: t('never') }));
+        }
+        [[1, 'day_1'], [7, 'day_7'], [30, 'day_30'], [90, 'day_90'], [365, 'day_365']].forEach(function(item) {
+          if (item[0] <= maxRetentionDays) expirationOptions.push(el('option', { value: String(item[0]), text: t(item[1]) }));
+        });
+        var expSelect = el('select', { id: 'exp-select' }, expirationOptions);
+        if (state.settings.storeForever) {
+          expSelect.value = '0';
+        } else {
+          var defaultExpirationDays = state.settings.defaultDays || (PS_SAAS_MODE && maxRetentionDays > 30 ? 365 : 30);
+          expSelect.value = String(defaultExpirationDays);
         }
 
         var noteLabel = el('label', { for: 'note', text: t('note_optional') });
@@ -1820,9 +2677,9 @@ function htmlPage(): string {
         form.addEventListener('submit', async function(evt) {
           evt.preventDefault();
           if (isUploading) return;
-          var hasFile = selectedFile || (fileInput.files && fileInput.files[0]);
+          var filesToUpload = selectedFiles.slice();
           var pastedText = paste.value.trim();
-          if (!hasFile && !pastedText) {
+          if (!filesToUpload.length && !pastedText) {
             setFlash(t('select_or_paste_first'), true);
             return;
           }
@@ -1833,27 +2690,57 @@ function htmlPage(): string {
           var expirationDaysValue = expSelect.value;
 
           try {
-            if (hasFile) {
-              var fileSize = Number(hasFile.size || 0);
-              if (fileSize >= multipartUploadThresholdBytes) {
-                await multipartUploadFile(hasFile, noteValue, expirationDaysValue);
-              } else {
-                await directUploadFile(hasFile, noteValue, expirationDaysValue);
+            if (filesToUpload.length) {
+              var failedFiles = [];
+              var uploadedCount = 0;
+              for (var fileIndex = 0; fileIndex < filesToUpload.length; fileIndex += 1) {
+                var file = filesToUpload[fileIndex];
+                setBusy(true, t('batch_upload_progress')
+                  .replace('{current}', String(fileIndex + 1))
+                  .replace('{total}', String(filesToUpload.length)));
+                try {
+                  var fileSize = Number(file.size || 0);
+                  if (fileSize >= multipartUploadThresholdBytes) {
+                    await multipartUploadFile(file, noteValue, expirationDaysValue);
+                  } else {
+                    await directUploadFile(file, noteValue, expirationDaysValue);
+                  }
+                  uploadedCount += 1;
+                } catch (fileError) {
+                  failedFiles.push(file);
+                  if (String(fileError && fileError.message) === 'Unauthorized') {
+                    failedFiles = filesToUpload.slice(fileIndex);
+                    break;
+                  }
+                }
               }
+
+              selectedFiles = failedFiles;
+              dropFileName.textContent = selectedFilesSummary();
+              fileInput.value = '';
+              paste.value = '';
+              if (uploadedCount > 0) await refreshFiles();
+              if (failedFiles.length) {
+                setFlash(t('batch_upload_partial')
+                  .replace('{uploaded}', String(uploadedCount))
+                  .replace('{total}', String(filesToUpload.length)), true);
+                return;
+              }
+              setFlash(t('batch_upload_success').replace('{count}', String(uploadedCount)), false);
             } else {
               var fd = new FormData();
               fd.append('pastedText', pastedText);
               fd.append('note', noteValue);
               fd.append('expirationDays', expirationDaysValue);
               await api('/api/entry', { method: 'POST', body: fd });
+              setFlash(t('upload_success'), false);
+              paste.value = '';
+              await refreshFiles();
             }
-            setFlash(t('upload_success'), false);
-            setSelectedFile(null);
-            fileInput.value = '';
-            paste.value = '';
             note.value = '';
-            await refreshFiles();
             state.view = 'files';
+            state.fileSearch = '';
+            state.filePage = 1;
             await render();
           } catch (err) {
             setFlash(String(err.message || err), true);
@@ -1869,11 +2756,111 @@ function htmlPage(): string {
       function createFilesView() {
         var root = el('section', { class: 'stack stack-wide' });
         root.appendChild(el('h1', { text: t('files') }));
+        var selectedFileIds = new Set();
+        var pageFiles = [];
+
+        var searchInput = el('input', {
+          type: 'search',
+          class: 'files-search-input',
+          placeholder: t('files_search_placeholder'),
+          'aria-label': t('files_search'),
+          value: state.fileSearch,
+        });
+        var countLabel = el('span', { class: 'files-count' });
+        var selectionCountLabel = el('span', { class: 'files-count' });
+        var bulkCopyButton = el('button', { type: 'button', class: 'btn secondary small', text: t('copy_selected_file_links') });
+        var bulkDeleteButton = el('button', { type: 'button', class: 'btn danger small', text: t('delete_selected_files') });
+        bulkCopyButton.disabled = true;
+        bulkDeleteButton.disabled = true;
+        var bulkToolbar = el('div', { class: 'files-bulk-toolbar hidden' }, [
+          selectionCountLabel,
+          el('div', { class: 'files-bulk-actions' }, [bulkCopyButton, bulkDeleteButton]),
+        ]);
+        root.appendChild(el('div', { class: 'files-toolbar' }, [
+          el('div', { class: 'files-search' }, [searchInput]),
+          countLabel,
+        ]));
+        root.appendChild(bulkToolbar);
+
+        var selectAllCheckbox = document.createElement('input');
+        selectAllCheckbox.type = 'checkbox';
+        selectAllCheckbox.className = 'file-select-checkbox';
+        selectAllCheckbox.setAttribute('aria-label', t('select_all_files_page'));
+        function updateSelectionToolbar() {
+          var selectedCount = selectedFileIds.size;
+          selectionCountLabel.textContent = t('files_selected_count').replace('{count}', String(selectedCount));
+          bulkCopyButton.disabled = selectedCount === 0;
+          bulkDeleteButton.disabled = selectedCount === 0;
+          bulkToolbar.classList.toggle('hidden', selectedCount === 0);
+          var selectedOnPage = pageFiles.filter(function(file) { return selectedFileIds.has(file.id); }).length;
+          selectAllCheckbox.checked = pageFiles.length > 0 && selectedOnPage === pageFiles.length;
+          selectAllCheckbox.indeterminate = selectedOnPage > 0 && selectedOnPage < pageFiles.length;
+          selectAllCheckbox.disabled = pageFiles.length === 0;
+        }
+        selectAllCheckbox.addEventListener('change', function() {
+          pageFiles.forEach(function(file) {
+            if (selectAllCheckbox.checked) selectedFileIds.add(file.id);
+            else selectedFileIds.delete(file.id);
+          });
+          renderFileRows();
+        });
+
+        bulkCopyButton.addEventListener('click', async function() {
+          var ids = Array.from(selectedFileIds);
+          if (!ids.length) return;
+          try {
+            await navigator.clipboard.writeText(ids.map(function(id) { return location.origin + '/-' + id; }).join('\\n'));
+            setFlash(t('selected_file_links_copied').replace('{count}', String(ids.length)), false);
+          } catch {
+            setFlash(t('clipboard_denied'), true);
+          }
+        });
+
+        bulkDeleteButton.addEventListener('click', async function() {
+          var ids = Array.from(selectedFileIds);
+          if (!ids.length) return;
+          var message = t('delete_selected_files_confirm').replace('{count}', String(ids.length));
+          if (!(await confirmAction(message, t('delete')))) return;
+          bulkDeleteButton.disabled = true;
+          bulkCopyButton.disabled = true;
+          var deleted = 0;
+          var failed = 0;
+          for (var i = 0; i < ids.length; i += 1) {
+            try {
+              await api('/api/entry/' + encodeURIComponent(ids[i]), { method: 'DELETE' });
+              deleted += 1;
+            } catch (err) {
+              failed += 1;
+              if (String(err && err.message) === 'Unauthorized') {
+                failed += ids.length - i - 1;
+                break;
+              }
+            }
+          }
+          selectedFileIds.clear();
+          try {
+            await refreshFiles();
+            setFlash(failed
+              ? t('files_delete_partial').replace('{deleted}', String(deleted)).replace('{failed}', String(failed))
+              : t('files_deleted_count').replace('{count}', String(deleted)), failed > 0);
+            await render();
+          } catch (err) {
+            setFlash(String(err.message || err), true);
+          }
+        });
 
         var tableWrap = el('div', { class: 'table-wrap' });
         var table = el('table', { class: 'files-table' });
+        var colgroup = el('colgroup');
+        ['file-col-select', 'file-col-name', 'file-col-note', 'file-col-size', 'file-col-uploaded', 'file-col-expiration', 'file-col-downloads', 'file-col-actions'].forEach(function(className) {
+          colgroup.appendChild(el('col', { class: className }));
+        });
+        table.appendChild(colgroup);
         var thead = el('thead');
         var headRow = el('tr');
+        var selectHeader = el('th', { scope: 'col', class: 'file-select-cell' });
+        selectHeader.appendChild(selectAllCheckbox);
+        headRow.appendChild(selectHeader);
         [t('filename'), t('note'), t('size'), t('uploaded'), t('expires'), t('downloads'), t('actions')].forEach(function(title) {
           headRow.appendChild(el('th', { scope: 'col', text: title }));
         });
@@ -1881,93 +2868,179 @@ function htmlPage(): string {
         table.appendChild(thead);
 
         var tbody = el('tbody');
-        state.files.forEach(function(file) {
-          var tr = el('tr');
-          tr.addEventListener('mouseenter', function(evt) { showPreview(file, evt); });
-          tr.addEventListener('mousemove', function(evt) { if (!filePreview.classList.contains('hidden')) movePreview(evt); });
-          tr.addEventListener('mouseleave', hidePreview);
-
-          var typeInfo = fileTypeInfo(file);
-          var filenameCell = el('td');
-          filenameCell.appendChild(
-            el('span', { class: 'file-cell' }, [
-              el('span', {
-                class: 'file-icon ' + typeInfo.typeClass,
-                text: typeInfo.icon,
-                title: typeInfo.label,
-                'aria-label': typeInfo.label + ' file',
-              }),
-              el('span', { class: 'file-name', text: file.filename }),
-            ]),
-          );
-
-          tr.appendChild(filenameCell);
-          tr.appendChild(el('td', { text: file.note || '' }));
-          tr.appendChild(el('td', { text: formatSize(file.size) }));
-          tr.appendChild(el('td', { text: formatDate(file.upload_time) }));
-          tr.appendChild(el('td', { text: formatDate(file.expiration_time) }));
-          tr.appendChild(
-            el('td', {}, [
-              el('button', {
-                type: 'button',
-                class: 'btn blue small',
-                text: String(file.download_count || 0),
-                'aria-label': t('history'),
-                onclick: function() {
-                  state.selectedId = file.id;
-                  state.downloadsUniqueOnly = false;
-                  state.view = 'downloads';
-                  render();
-                },
-              }),
-            ]),
-          );
-
-          var actions = el('td', { class: 'actions' });
-          actions.appendChild(el('button', {
-            type: 'button', class: 'btn blue small', text: 'i', 'aria-label': t('view_file_info'), onclick: function() {
-              state.selectedId = file.id;
-              state.view = 'fileInfo';
-              render();
+        var previousButton = el('button', {
+          type: 'button',
+          class: 'btn secondary small',
+          text: t('previous_page'),
+          onclick: function() {
+            if (state.filePage > 1) {
+              selectedFileIds.clear();
+              state.filePage -= 1;
+              renderFileRows();
             }
-          }));
-          actions.appendChild(el('button', {
-            type: 'button', class: 'btn secondary small', text: '✎', 'aria-label': t('edit_file'), onclick: function() {
-              state.selectedId = file.id;
-              state.view = 'fileEdit';
-              render();
-            }
-          }));
-          actions.appendChild(el('button', {
-            type: 'button', class: 'btn blue small', text: '⧉', 'aria-label': t('copy_short_link'), onclick: async function() {
-              try {
-                await navigator.clipboard.writeText(location.origin + '/-' + file.id);
-                setFlash(t('link_copied'), false);
-              } catch {
-                setFlash(t('clipboard_denied'), true);
-              }
-            }
-          }));
-          actions.appendChild(el('button', {
-            type: 'button', class: 'btn danger small', text: t('delete'), 'aria-label': t('delete_file'), onclick: async function() {
-              if (!(await confirmAction(t('delete_file_confirm'), t('delete')))) return;
-              try {
-                await api('/api/entry/' + encodeURIComponent(file.id), { method: 'DELETE' });
-                await refreshFiles();
-                setFlash(t('file_deleted'), false);
+          },
+        });
+        var pageInfo = el('span', { class: 'files-page-info' });
+        var nextButton = el('button', {
+          type: 'button',
+          class: 'btn secondary small',
+          text: t('next_page'),
+          onclick: function() {
+            selectedFileIds.clear();
+            state.filePage += 1;
+            renderFileRows();
+          },
+        });
+
+        function renderFileRows() {
+          var query = searchInput.value.trim().toLocaleLowerCase();
+          state.fileSearch = searchInput.value;
+          var filteredFiles = state.files.filter(function(file) {
+            return !query || (String(file.filename || '') + ' ' + String(file.note || '')).toLocaleLowerCase().includes(query);
+          });
+          var pageCount = Math.max(1, Math.ceil(filteredFiles.length / 50));
+          state.filePage = Math.min(Math.max(1, state.filePage), pageCount);
+          var start = (state.filePage - 1) * 50;
+          pageFiles = filteredFiles.slice(start, start + 50);
+
+          countLabel.textContent = t('files_count').replace('{count}', String(filteredFiles.length));
+          pageInfo.textContent = t('files_page_info')
+            .replace('{page}', String(state.filePage))
+            .replace('{pages}', String(pageCount));
+          previousButton.disabled = state.filePage <= 1;
+          nextButton.disabled = state.filePage >= pageCount;
+          tbody.innerHTML = '';
+          updateSelectionToolbar();
+
+          if (pageFiles.length === 0) {
+            var emptyRow = el('tr');
+            emptyRow.appendChild(el('td', {
+              colspan: 8,
+              class: 'muted',
+              text: state.files.length ? t('no_matching_files') : t('no_files_in_list'),
+            }));
+            tbody.appendChild(emptyRow);
+            return;
+          }
+
+          pageFiles.forEach(function(file) {
+            var tr = el('tr');
+            tr.addEventListener('mouseenter', function(evt) { showPreview(file, evt); });
+            tr.addEventListener('mousemove', function(evt) { if (!filePreview.classList.contains('hidden')) movePreview(evt); });
+            tr.addEventListener('mouseleave', hidePreview);
+
+            var selectCell = el('td', { class: 'file-select-cell' });
+            var rowCheckbox = document.createElement('input');
+            rowCheckbox.type = 'checkbox';
+            rowCheckbox.className = 'file-select-checkbox';
+            rowCheckbox.checked = selectedFileIds.has(file.id);
+            rowCheckbox.setAttribute('aria-label', t('select_file').replace('{name}', String(file.filename || file.id)));
+            rowCheckbox.addEventListener('change', function() {
+              if (rowCheckbox.checked) selectedFileIds.add(file.id);
+              else selectedFileIds.delete(file.id);
+              updateSelectionToolbar();
+            });
+            selectCell.appendChild(rowCheckbox);
+            tr.appendChild(selectCell);
+
+            var typeInfo = fileTypeInfo(file);
+            var filenameCell = el('td');
+            filenameCell.appendChild(
+              el('span', { class: 'file-cell' }, [
+                el('span', {
+                  class: 'file-icon ' + typeInfo.typeClass,
+                  text: typeInfo.icon,
+                  title: typeInfo.label,
+                  'aria-label': typeInfo.label + ' file',
+                }),
+                el('span', { class: 'file-name', text: file.filename }),
+              ]),
+            );
+
+            tr.appendChild(filenameCell);
+            var noteCell = el('td', {
+              class: 'note-cell',
+              text: file.note || '',
+              title: file.note ? String(file.note) : null,
+              'aria-label': file.note ? String(file.note) : null,
+            });
+            noteCell.addEventListener('mouseenter', hidePreview);
+            tr.appendChild(noteCell);
+            tr.appendChild(el('td', { text: formatSize(file.size) }));
+            tr.appendChild(el('td', { text: formatDate(file.upload_time) }));
+            tr.appendChild(el('td', { text: formatDate(file.expiration_time) }));
+            tr.appendChild(
+              el('td', {}, [
+                el('button', {
+                  type: 'button',
+                  class: 'btn blue small',
+                  text: String(file.download_count || 0),
+                  'aria-label': t('history'),
+                  onclick: function() {
+                    state.selectedId = file.id;
+                    state.downloadsUniqueOnly = false;
+                    state.view = 'downloads';
+                    render();
+                  },
+                }),
+              ]),
+            );
+
+            var actions = el('td', { class: 'actions' });
+            actions.appendChild(el('button', {
+              type: 'button', class: 'btn blue small', text: 'i', 'aria-label': t('view_file_info'), title: t('view_file_info'), onclick: function() {
+                state.selectedId = file.id;
+                state.view = 'fileInfo';
                 render();
-              } catch (err) {
-                setFlash(String(err.message || err), true);
               }
-            }
-          }));
-          tr.appendChild(actions);
-          tbody.appendChild(tr);
+            }));
+            actions.appendChild(el('button', {
+              type: 'button', class: 'btn secondary small', text: '✎', 'aria-label': t('edit_file'), title: t('edit_file'), onclick: function() {
+                state.selectedId = file.id;
+                state.view = 'fileEdit';
+                render();
+              }
+            }));
+            actions.appendChild(el('button', {
+              type: 'button', class: 'btn blue small', text: '⧉', 'aria-label': t('copy_short_link'), title: t('copy_short_link'), onclick: async function() {
+                try {
+                  await navigator.clipboard.writeText(location.origin + '/-' + file.id);
+                  setFlash(t('link_copied'), false);
+                } catch {
+                  setFlash(t('clipboard_denied'), true);
+                }
+              }
+            }));
+            actions.appendChild(el('button', {
+              type: 'button', class: 'btn danger small', text: t('delete'), 'aria-label': t('delete_file'), title: t('delete_file'), onclick: async function() {
+                if (!(await confirmAction(t('delete_file_confirm'), t('delete')))) return;
+                try {
+                  await api('/api/entry/' + encodeURIComponent(file.id), { method: 'DELETE' });
+                  await refreshFiles();
+                  setFlash(t('file_deleted'), false);
+                  render();
+                } catch (err) {
+                  setFlash(String(err.message || err), true);
+                }
+              }
+            }));
+            tr.appendChild(actions);
+            tbody.appendChild(tr);
+          });
+        }
+
+        searchInput.addEventListener('input', function() {
+          selectedFileIds.clear();
+          state.filePage = 1;
+          renderFileRows();
         });
 
         table.appendChild(tbody);
         tableWrap.appendChild(table);
         root.appendChild(tableWrap);
+        var pagination = el('div', { class: 'files-pagination' }, [previousButton, pageInfo, nextButton]);
+        root.appendChild(pagination);
+        renderFileRows();
         return root;
       }
 
@@ -1976,20 +3049,19 @@ function htmlPage(): string {
         var data = await api('/api/entry/' + encodeURIComponent(id));
         var versionsData = await api('/api/entry/' + encodeURIComponent(id) + '/versions');
         var versions = versionsData.versions || [];
-        var root = el('section', { class: 'stack' });
+        var root = el('section', { class: 'stack file-info-page' });
         root.appendChild(el('h1', { text: t('file_information') }));
         function kv(label, value) {
-          var block = el('div');
+          var block = el('div', { class: 'file-meta-item' });
           block.appendChild(el('strong', { text: label }));
-          block.appendChild(el('br'));
-          block.appendChild(document.createTextNode(value));
+          block.appendChild(el('span', { class: 'file-meta-value', text: value }));
           return block;
         }
 
         var fullLink = location.origin + '/-' + data.id + '/' + data.filename;
         var shortLink = location.origin + '/-' + data.id;
 
-        var linksPanel = el('div', { class: 'panel stack' }, [
+        var linksPanel = el('div', { class: 'panel stack file-links' }, [
           el('h3', { text: t('links') }),
           el('div', { class: 'row' }, [
             el('a', { href: fullLink, target: '_blank', rel: 'noreferrer', text: fullLink }),
@@ -2005,17 +3077,16 @@ function htmlPage(): string {
 
         root.appendChild(linksPanel);
 
-        var info = el('div', { class: 'stack' });
+        var info = el('div', { class: 'file-meta-grid' });
         info.appendChild(kv(t('filename'), data.filename));
         info.appendChild(kv(t('size'), formatSize(data.size)));
         info.appendChild(kv(t('current_version'), String(data.version || 1)));
         info.appendChild(kv(t('file_md5'), data.md5 || t('not_available')));
         info.appendChild(kv(t('last_updated'), formatDateTime(data.updated_time)));
-        info.appendChild(kv(t('expires'), formatDate(data.expiration_time)));
-        var downloadsWrap = el('div');
+        info.appendChild(kv(t('expires'), data.expiration_time ? formatDate(data.expiration_time) : t('never')));
+        var downloadsWrap = el('div', { class: 'file-meta-item file-meta-downloads' });
         downloadsWrap.appendChild(el('strong', { text: t('downloads') }));
-        downloadsWrap.appendChild(el('br'));
-        var dlRow = el('span', { class: 'row' }, [
+        var dlRow = el('span', { class: 'file-meta-value' }, [
           document.createTextNode(String(data.download_count || 0)),
           el('button', {
             type: 'button',
@@ -2035,13 +3106,13 @@ function htmlPage(): string {
         info.appendChild(kv(t('uploaded_by'), t('you')));
         root.appendChild(info);
 
-        var versionsPanel = el('div', { class: 'panel stack' });
+        var versionsPanel = el('div', { class: 'panel stack versions-panel' });
         versionsPanel.appendChild(el('h3', { text: t('versions') }));
         if (versions.length === 0) {
           versionsPanel.appendChild(el('div', { class: 'muted', text: t('no_versions') }));
         } else {
           var versionsWrap = el('div', { class: 'table-wrap' });
-          var versionsTable = el('table', { class: 'files-table' });
+          var versionsTable = el('table', { class: 'version-history-table' });
           var versionsHead = el('tr');
           [t('version_number'), t('size'), t('file_md5'), t('version_time'), t('actions')].forEach(function(title) {
             versionsHead.appendChild(el('th', { scope: 'col', text: title }));
@@ -2050,11 +3121,11 @@ function htmlPage(): string {
           var versionsBody = el('tbody');
           versions.forEach(function(version) {
             var row = el('tr');
-            row.appendChild(el('td', { text: String(version.version) }));
-            row.appendChild(el('td', { text: formatSize(version.size) }));
-            row.appendChild(el('td', { text: version.md5 || t('not_available') }));
-            row.appendChild(el('td', { text: formatDateTime(version.created_time) }));
-            row.appendChild(el('td', { class: 'actions' }, [
+            row.appendChild(el('td', { text: String(version.version), 'data-label': t('version_number') }));
+            row.appendChild(el('td', { text: formatSize(version.size), 'data-label': t('size') }));
+            row.appendChild(el('td', { class: 'version-md5', text: version.md5 || t('not_available'), 'data-label': t('file_md5') }));
+            row.appendChild(el('td', { class: 'version-time', text: formatDateTime(version.created_time), 'data-label': t('version_time') }));
+            row.appendChild(el('td', { class: 'actions version-actions', 'data-label': t('actions') }, [
               el('button', {
                 type: 'button',
                 class: 'btn blue small',
@@ -2136,6 +3207,31 @@ function htmlPage(): string {
 
         fileInput.addEventListener('change', function() {
           syncSelection(fileInput.files && fileInput.files[0] ? fileInput.files[0] : null);
+          fileInput.value = '';
+        });
+        ['dragenter', 'dragover'].forEach(function(type) {
+          drop.addEventListener(type, function(evt) {
+            evt.preventDefault();
+            drop.classList.add('dragover');
+          });
+        });
+        ['dragleave', 'dragend'].forEach(function(type) {
+          drop.addEventListener(type, function(evt) {
+            evt.preventDefault();
+            drop.classList.remove('dragover');
+          });
+        });
+        drop.addEventListener('drop', function(evt) {
+          evt.preventDefault();
+          drop.classList.remove('dragover');
+          var files = evt.dataTransfer && evt.dataTransfer.files;
+          if (!files || files.length === 0) return;
+          if (files.length > 1) {
+            syncSelection(null);
+            setFlash(t('select_one_update_file'), true);
+            return;
+          }
+          syncSelection(files[0]);
         });
         syncSelection(null);
         form.appendChild(drop);
@@ -2255,24 +3351,33 @@ function htmlPage(): string {
         var form = el('form', { class: 'stack' });
         var filename = el('input', { id: 'edit-filename', type: 'text', value: data.filename });
         var deleteAfter = el('input', { id: 'edit-delete-after', type: 'checkbox' });
-        var exp = el('select', { id: 'edit-exp' }, [
-          el('option', { value: '0', text: t('never') }),
-          el('option', { value: '1', text: t('day_1') }),
-          el('option', { value: '7', text: t('day_7') }),
-          el('option', { value: '30', text: t('day_30') }),
-          el('option', { value: '90', text: t('day_90') }),
-        ]);
+        var maxRetentionDays = Number(state.planLimits && state.planLimits.maxFileLifetimeDays) || 3650;
+        var expirationOptions = [];
+        if (!PS_SAAS_MODE || (PS_SAAS_MODE && maxRetentionDays > 30)) expirationOptions.push(el('option', { value: '0', text: t('never') }));
+        [[1, 'day_1'], [7, 'day_7'], [30, 'day_30'], [90, 'day_90'], [365, 'day_365']].forEach(function(item) {
+          if (item[0] <= maxRetentionDays) expirationOptions.push(el('option', { value: String(item[0]), text: t(item[1]) }));
+        });
+        var exp = el('select', { id: 'edit-exp' }, expirationOptions);
         if (data.expiration_time) {
           var daysLeft = Math.max(1, Math.ceil((new Date(data.expiration_time).getTime() - Date.now()) / (24 * 3600 * 1000)));
-          exp.value = String(daysLeft > 90 ? 90 : daysLeft);
+          var availableDays = [1, 7, 30, 90, 365].filter(function(days) { return days <= maxRetentionDays && days <= daysLeft; });
+          exp.value = String(availableDays.length ? availableDays[availableDays.length - 1] : 1);
           deleteAfter.checked = true;
+        } else if (PS_SAAS_MODE) {
+          var maxOptionDays = [1, 7, 30, 90, 365].filter(function(days) { return days <= maxRetentionDays; });
+          exp.value = maxRetentionDays > 30 ? '0' : String(maxOptionDays[maxOptionDays.length - 1] || 30);
+          deleteAfter.checked = true;
+        }
+        if (PS_SAAS_MODE && maxRetentionDays <= 30) {
+          deleteAfter.checked = true;
+          deleteAfter.disabled = true;
         }
 
         var note = el('input', { id: 'edit-note', type: 'text', value: data.note || '' });
 
         form.appendChild(el('div', {}, [el('label', { for: 'edit-filename', text: t('filename') }), filename]));
         form.appendChild(el('div', {}, [el('label', { for: 'edit-exp', text: t('expiration') })]));
-        form.appendChild(el('div', { class: 'check-row' }, [
+        if (!PS_SAAS_MODE) form.appendChild(el('div', { class: 'check-row' }, [
           deleteAfter,
           el('label', { for: 'edit-delete-after', text: t('delete_after_expiration') })
         ]));
@@ -2470,7 +3575,8 @@ function htmlPage(): string {
 
         var storeForever = el('input', { id: 'set-store-forever', type: 'checkbox' });
         if (state.settings.storeForever) storeForever.checked = true;
-        var days = el('input', { id: 'set-days', type: 'number', min: '1', value: String(state.settings.defaultDays || 30) });
+        if (PS_SAAS_MODE) storeForever.disabled = !(state.planLimits && state.planLimits.maxFileLifetimeDays > 30);
+        var days = el('input', { id: 'set-days', type: 'number', min: '1', value: String(state.settings.defaultDays || (PS_SAAS_MODE && state.planLimits && state.planLimits.maxFileLifetimeDays > 30 ? 365 : 30)) });
 
         var toggleRow = el('div', { class: 'toggle-row' }, [
           storeForever,
@@ -2490,7 +3596,8 @@ function htmlPage(): string {
         storeForever.addEventListener('change', syncDaysState);
         syncDaysState();
 
-        form.appendChild(toggleRow);
+        if (!PS_SAAS_MODE) form.appendChild(toggleRow);
+        else form.appendChild(el('div', { class: 'small', text: t('retention_plan_help') }));
         form.appendChild(daysRow);
 
         form.appendChild(
@@ -2506,10 +3613,13 @@ function htmlPage(): string {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               storeForever: storeForever.checked,
-              defaultDays: Number(days.value || 30),
+              defaultDays: storeForever.checked && PS_SAAS_MODE ? 0 : Number(days.value || 30),
             }),
           });
-          state.settings = { storeForever: storeForever.checked, defaultDays: Number(days.value || 30) };
+          state.settings = {
+            storeForever: storeForever.checked,
+            defaultDays: storeForever.checked && PS_SAAS_MODE ? 0 : Number(days.value || 30),
+          };
           setFlash(t('settings_saved'), false);
         });
 
@@ -2547,7 +3657,8 @@ function htmlPage(): string {
           render();
         });
       });
-      document.getElementById('nav-clips-btn').addEventListener('click', function() {
+      var clipsButton = document.getElementById('nav-clips-btn');
+      if (clipsButton) clipsButton.addEventListener('click', function() {
         location.href = '/clips';
       });
 
@@ -2572,8 +3683,31 @@ function htmlPage(): string {
       });
 
       document.getElementById('logout-btn').addEventListener('click', logout);
+      authRetryButton.addEventListener('click', restoreSaasSession);
+      document.getElementById('menu-account').addEventListener('click', function() { location.href = '/account'; });
       langToggle.addEventListener('click', switchLang);
       loginBtn.addEventListener('click', login);
+      document.getElementById('saas-email-auth-form').addEventListener('submit', submitSaasEmailAuth);
+      document.getElementById('saas-email-mode-toggle').addEventListener('click', function() {
+        saasEmailMode = saasEmailMode === 'sign-in' ? 'sign-up' : 'sign-in';
+        document.getElementById('saas-email-error').textContent = '';
+        renderSaasEmailMode();
+      });
+      document.getElementById('google-login-btn').addEventListener('click', async function() {
+        if (!PS_GOOGLE_LOGIN_ENABLED) return;
+        try {
+          var response = await fetch('/api/auth/sign-in/social', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider: 'google', callbackURL: '/app' }),
+          });
+          var data = await response.json();
+          if (!response.ok || !data.url) throw new Error(data.message || 'Google 登录失败');
+          location.href = data.url;
+        } catch (err) {
+          setFlash(String((err && err.message) || err), true);
+        }
+      });
       pwEl.addEventListener('keydown', function(evt) {
         if (evt.key === 'Enter') login();
       });
@@ -2582,7 +3716,16 @@ function htmlPage(): string {
         if (document.hidden) hidePreview();
       });
 
-      if (state.pw) {
+      applyStaticTranslations();
+      if (PS_SAAS_MODE) {
+        pwEl.parentElement.style.display = 'none';
+        loginBtn.style.display = 'none';
+        document.getElementById('saas-email-auth-form').style.display = 'grid';
+        document.getElementById('menu-account').style.display = 'block';
+        document.getElementById('login-help').textContent = t('saas_login_help');
+        document.getElementById('google-login-btn').style.display = PS_GOOGLE_LOGIN_ENABLED ? 'inline-flex' : 'none';
+        restoreSaasSession();
+      } else if (state.pw) {
         loginEl.classList.add('hidden');
         appEl.classList.remove('hidden');
         loadInitialData().then(render).catch(function() {
@@ -2590,35 +3733,133 @@ function htmlPage(): string {
           setFlash(t('session_expired'), true);
         });
       }
-      applyStaticTranslations();
     })();
   </script>
 </body>
 </html>`;
 }
 
-async function getEntryById(env: Env, id: string): Promise<EntryRow | null> {
+async function getEntryById(env: Env, id: string, ownerId?: string | null): Promise<EntryRow | null> {
   return env.DB.prepare(
     `SELECT id, filename, content_type, size, md5,
             COALESCE(version, 1) AS version, current_object_key,
-            upload_time, COALESCE(updated_time, upload_time) AS updated_time,
+            upload_time, COALESCE(updated_time, upload_time) AS updated_time, owner_id,
             expiration_time, note, guest_link_id
      FROM entries
-     WHERE id = ?`,
+     WHERE id = ?${ownerId ? " AND owner_id = ?" : ""}`,
   )
-    .bind(id)
+    .bind(...(ownerId ? [id, ownerId] : [id]))
     .first<EntryRow>();
 }
 
-async function getMultipartUploadById(env: Env, uploadId: string): Promise<MultipartUploadRow | null> {
+async function getMultipartUploadById(env: Env, uploadId: string, ownerId?: string | null): Promise<MultipartUploadRow | null> {
   return env.DB.prepare(
-    `SELECT upload_id, entry_id, filename, content_type, size, expiration_time, note,
-            is_update, expected_version, object_key
+    `SELECT upload_id, entry_id, filename, content_type, size, expiration_time, note, owner_id,
+            is_update, expected_version, object_key, complete_token, complete_started_at, active_parts
      FROM multipart_uploads
-     WHERE upload_id = ?`,
+     WHERE upload_id = ?${ownerId ? " AND owner_id = ?" : ""}`,
   )
-    .bind(uploadId)
+    .bind(...(ownerId ? [uploadId, ownerId] : [uploadId]))
     .first<MultipartUploadRow>();
+}
+
+async function claimMultipartCompletion(
+  env: Env,
+  uploadId: string,
+  ownerId: string | null,
+  token: string,
+  allowStaleAbortRecovery = false,
+): Promise<boolean> {
+  const ownerClause = ownerId ? " AND owner_id = ?" : "";
+  // Normal completion never takes over another request's live claim. An owner
+  // may recover a crashed completion through abort after a full day; that is
+  // longer than a Worker request can remain active, and the token also fences
+  // any late D1 commit from the abandoned request.
+  const staleClaimClause = allowStaleAbortRecovery
+    ? " OR complete_started_at < datetime('now', '-24 hours')"
+    : "";
+  const activePartsClause = allowStaleAbortRecovery
+    ? "(active_parts = 0 OR active_parts_updated_at < datetime('now', '-24 hours'))"
+    : "active_parts = 0";
+  const resetStaleParts = allowStaleAbortRecovery ? ", active_parts = 0" : "";
+  const values = ownerId
+    ? [token, uploadId, ownerId]
+    : [token, uploadId];
+  const result = await env.DB.prepare(
+    `UPDATE multipart_uploads
+     SET complete_token = ?, complete_started_at = CURRENT_TIMESTAMP${resetStaleParts}
+     WHERE upload_id = ?${ownerClause}
+       AND ${activePartsClause}
+       AND (complete_token IS NULL${staleClaimClause})`,
+  ).bind(...values).run();
+  return result.meta.changes === 1;
+}
+
+async function releaseMultipartCompletionClaim(env: Env, uploadId: string, token: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE multipart_uploads
+     SET complete_token = NULL, complete_started_at = NULL
+     WHERE upload_id = ? AND complete_token = ? AND active_parts = 0`,
+  ).bind(uploadId, token).run();
+}
+
+async function cleanupMultipartUpload(
+  env: Env,
+  uploadId: string,
+  objectKey: string,
+  entryId: string,
+  reservationOwnerId?: string,
+  completionToken?: string,
+  deleteCompletedObject = false,
+): Promise<boolean> {
+  if (!completionToken) return false;
+  let ownsClaim = false;
+  try {
+    const refresh = await env.DB.prepare(
+      `UPDATE multipart_uploads SET complete_started_at = CURRENT_TIMESTAMP
+       WHERE upload_id = ? AND complete_token = ?`,
+    ).bind(uploadId, completionToken).run();
+    ownsClaim = refresh.meta.changes === 1;
+  } catch { /* Keep the reservation and claim if D1 is unavailable. */ }
+  if (!ownsClaim) return false;
+
+  try {
+    await env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id = ?").bind(uploadId).run();
+  } catch {
+    return false;
+  }
+  try { await env.BUCKET.resumeMultipartUpload(objectKey, uploadId).abort(); } catch { /* Completed uploads are already closed. */ }
+  if (deleteCompletedObject) {
+    try {
+      const referenced = await env.DB.prepare(
+        `SELECT
+           EXISTS(SELECT 1 FROM entries WHERE id = ? AND COALESCE(current_object_key, id) = ?) OR
+           EXISTS(SELECT 1 FROM file_versions WHERE object_key = ?) AS referenced`,
+      ).bind(entryId, objectKey, objectKey).first<{ referenced: number }>();
+      if (!referenced) return false;
+      if (!referenced.referenced) await env.BUCKET.delete(objectKey);
+    } catch {
+      return false;
+    }
+  }
+
+  const cleanupStatements = [env.DB.prepare(
+    "DELETE FROM multipart_uploads WHERE upload_id = ? AND complete_token = ?",
+  ).bind(uploadId, completionToken)];
+  if (reservationOwnerId) {
+    cleanupStatements.push(env.DB.prepare(
+      `DELETE FROM saas_storage_reservations
+       WHERE reservation_id = ? AND user_id = ?
+         AND NOT EXISTS (SELECT 1 FROM multipart_uploads WHERE upload_id = ?)`,
+    ).bind(uploadId, reservationOwnerId, uploadId));
+  }
+  try {
+    // D1 removes the claim and any leftover reservation atomically. If the token
+    // changed during cleanup, the new claim and its reservation remain intact.
+    const results = await env.DB.batch(cleanupStatements);
+    return results[0].meta.changes === 1;
+  } catch { /* Leave the refreshed claim for a stale-upload retry. */ }
+  return false;
 }
 
 function fileVersionObjectKey(entryId: string, version: number): string {
@@ -2631,6 +3872,36 @@ function newFileVersionObjectKey(entryId: string, version: number): string {
 
 function currentObjectKey(entry: Pick<EntryRow, "id" | "current_object_key">): string {
   return entry.current_object_key || entry.id;
+}
+
+const HTML_FILE_PREVIEW_CSP = [
+  // Render uploaded HTML prototypes and interactive pages inside an opaque-origin
+  // sandbox. Scripts and cross-origin API connections are allowed, but the page
+  // gets no same-origin access, form submission, nested frames, plugins, or base-URL override.
+  "sandbox allow-scripts",
+  "default-src 'none'",
+  "script-src 'unsafe-inline' http: https:",
+  "style-src 'unsafe-inline' http: https:",
+  "img-src data: blob: http: https:",
+  "font-src data: http: https:",
+  "media-src data: blob: http: https:",
+  "connect-src http: https: ws: wss:",
+  "form-action 'none'",
+  "frame-src 'none'",
+  "object-src 'none'",
+  "base-uri 'none'",
+].join("; ");
+
+function setSharedFileContentType(headers: Headers, entry: Pick<EntryRow, "filename" | "content_type">): void {
+  const contentType = (entry.content_type || "").split(";")[0].trim().toLowerCase();
+  const isHtml = /\.html?$/i.test(entry.filename) || contentType === "text/html";
+  if (isHtml) {
+    headers.set("Content-Type", "text/html; charset=utf-8");
+    headers.set("Content-Security-Policy", HTML_FILE_PREVIEW_CSP);
+    headers.set("X-Content-Type-Options", "nosniff");
+  } else if (entry.content_type) {
+    headers.set("Content-Type", entry.content_type);
+  }
 }
 
 async function getFileVersion(
@@ -2650,37 +3921,12 @@ async function getFileVersion(
 async function snapshotCurrentFileVersion(env: Env, entry: EntryRow): Promise<FileVersionRow> {
   const currentVersion = Math.max(1, Number(entry.version || 1));
   const currentKey = currentObjectKey(entry);
-  const historyKey = fileVersionObjectKey(entry.id, currentVersion);
   const existing = await getFileVersion(env, entry.id, currentVersion);
-  if (currentKey === historyKey && existing) return existing;
+  if (existing) return existing;
 
   const object = await env.BUCKET.get(currentKey);
   if (!object || !object.body) throw new Error("current file content not found");
-
-  const [copyBody, hashBody] = object.body.tee();
-  const [, md5] = await Promise.all([
-    env.BUCKET.put(historyKey, copyBody, { httpMetadata: { contentType: entry.content_type || "application/octet-stream" } }),
-    md5HexFromStream(hashBody),
-  ]);
-
-  if (existing) {
-    await env.DB.prepare(
-      `UPDATE file_versions
-       SET filename = ?, content_type = ?, size = ?, md5 = ?, object_key = ?
-       WHERE entry_id = ? AND version = ?`,
-    )
-      .bind(
-        entry.filename,
-        entry.content_type,
-        entry.size,
-        md5,
-        historyKey,
-        entry.id,
-        currentVersion,
-      )
-      .run();
-    return { ...existing, filename: entry.filename, content_type: entry.content_type, size: entry.size, md5, object_key: historyKey };
-  }
+  const md5 = entry.md5 || await md5HexFromStream(object.body);
 
   const record = {
     entry_id: entry.id,
@@ -2690,7 +3936,9 @@ async function snapshotCurrentFileVersion(env: Env, entry: EntryRow): Promise<Fi
     size: entry.size,
     md5: md5,
     created_time: entry.upload_time,
-    object_key: historyKey,
+    // Keep the current object as the version snapshot. Content updates replace
+    // the entry's current_object_key, so the previous bytes remain addressable.
+    object_key: currentKey,
   };
   await env.DB.prepare(
     `INSERT OR IGNORE INTO file_versions
@@ -2699,31 +3947,62 @@ async function snapshotCurrentFileVersion(env: Env, entry: EntryRow): Promise<Fi
   )
     .bind(record.entry_id, record.version, record.filename, record.content_type, record.size, record.md5, record.created_time, record.object_key)
     .run();
-  return record;
+  return (await getFileVersion(env, entry.id, currentVersion)) || record;
 }
 
-async function recordNewFileVersion(
+async function saveNewFileEntry(
   env: Env,
-  entry: Pick<EntryRow, "id" | "filename" | "content_type" | "size">,
-  version: number,
-  md5: string,
-  objectKey = entry.id,
+  entry: { id: string; filename: string; contentType: string; size: number; md5: string; expiration: string | null; note: string | null; ownerId: string },
+  reservation?: { id: string; consumeBytes: number; final: boolean },
+  completionClaim?: { uploadId: string; token: string },
 ): Promise<void> {
-  await env.DB.prepare(
-    `INSERT INTO file_versions
-      (entry_id, version, filename, content_type, size, md5, object_key)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      entry.id,
-      version,
-      entry.filename,
-      entry.content_type,
-      entry.size,
-      md5,
-      objectKey,
-    )
-    .run();
+  const reservationGate = reservation
+    ? `EXISTS (SELECT 1 FROM saas_storage_reservations
+              WHERE reservation_id = ? AND user_id = ? AND reserved_bytes >= ?
+                AND expires_at > CURRENT_TIMESTAMP)`
+    : "1 = 1";
+  const claimGate = completionClaim
+    ? "EXISTS (SELECT 1 FROM multipart_uploads WHERE upload_id = ? AND complete_token = ?)"
+    : "1 = 1";
+  const gateSql = `(${reservationGate}) AND (${claimGate})`;
+  const reservationValues = reservation
+    ? [reservation.id, entry.ownerId, Math.max(0, Math.floor(reservation.consumeBytes))]
+    : [];
+  const claimValues = completionClaim ? [completionClaim.uploadId, completionClaim.token] : [];
+  const gateValues = [...reservationValues, ...claimValues];
+  const insertEntry = env.DB.prepare(
+    `INSERT INTO entries
+       (id, filename, content_type, size, md5, version, updated_time, expiration_time, note, owner_id)
+     SELECT ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?, ?
+     WHERE ${gateSql}`,
+  ).bind(entry.id, entry.filename, entry.contentType, entry.size, entry.md5, entry.expiration, entry.note, entry.ownerId, ...gateValues);
+  const insertVersion = env.DB.prepare(
+    `INSERT INTO file_versions(entry_id, version, filename, content_type, size, md5, object_key)
+     SELECT ?, 1, ?, ?, ?, ?, ?
+     WHERE EXISTS (SELECT 1 FROM entries WHERE id = ?)
+       AND ${gateSql}`,
+  ).bind(entry.id, entry.filename, entry.contentType, entry.size, entry.md5, entry.id, entry.id, ...gateValues);
+  const statements = [insertEntry, insertVersion];
+  if (reservation?.final) {
+    statements.push(env.DB.prepare(
+      `DELETE FROM saas_storage_reservations
+       WHERE reservation_id = ? AND user_id = ? AND reserved_bytes >= ? AND expires_at > CURRENT_TIMESTAMP
+         AND EXISTS (SELECT 1 FROM entries WHERE id = ?)
+         AND (${claimGate})`,
+    ).bind(reservation.id, entry.ownerId, Math.max(0, Math.floor(reservation.consumeBytes)), entry.id, ...claimValues));
+  } else if (reservation) {
+    statements.push(env.DB.prepare(
+      `UPDATE saas_storage_reservations SET reserved_bytes = reserved_bytes - ?
+       WHERE reservation_id = ? AND user_id = ? AND reserved_bytes >= ? AND expires_at > CURRENT_TIMESTAMP
+         AND EXISTS (SELECT 1 FROM entries WHERE id = ?)
+         AND (${claimGate})`,
+    ).bind(Math.max(0, Math.floor(reservation.consumeBytes)), reservation.id, entry.ownerId,
+      Math.max(0, Math.floor(reservation.consumeBytes)), entry.id, ...claimValues));
+  }
+  const results = await env.DB.batch(statements);
+  if (results[0].meta.changes !== 1 || results[1].meta.changes !== 1 || (reservation && results[2].meta.changes !== 1)) {
+    throw new Error("Could not commit file within the account storage quota");
+  }
 }
 
 async function commitFileContentUpdate(
@@ -2734,25 +4013,46 @@ async function commitFileContentUpdate(
   md5: string,
   objectKey: string,
   expectedVersion = Math.max(1, Number(entry.version || 1)),
+  reservation?: { id: string; ownerId: string; consumeBytes: number },
+  completionClaim?: { uploadId: string; token: string },
 ): Promise<number> {
   const nextVersion = expectedVersion + 1;
+  const reservationGate = reservation
+    ? "AND EXISTS (SELECT 1 FROM saas_storage_reservations WHERE reservation_id = ? AND user_id = ? AND reserved_bytes >= ? AND expires_at > CURRENT_TIMESTAMP)"
+    : "";
+  const reservationValues = reservation ? [reservation.id, reservation.ownerId, Math.max(0, Math.floor(reservation.consumeBytes))] : [];
+  const completionGate = completionClaim
+    ? "AND EXISTS (SELECT 1 FROM multipart_uploads WHERE upload_id = ? AND complete_token = ?)"
+    : "";
+  const completionValues = completionClaim ? [completionClaim.uploadId, completionClaim.token] : [];
   const updateStatement = env.DB.prepare(
     `UPDATE entries
      SET content_type = ?, size = ?, md5 = ?, version = ?, current_object_key = ?, updated_time = CURRENT_TIMESTAMP
-     WHERE id = ? AND COALESCE(version, 1) = ?`,
+     WHERE id = ? AND COALESCE(version, 1) = ? ${reservationGate} ${completionGate}`,
   )
-    .bind(contentType, size, md5, nextVersion, objectKey, entry.id, expectedVersion);
+    .bind(contentType, size, md5, nextVersion, objectKey, entry.id, expectedVersion, ...reservationValues, ...completionValues);
   const versionStatement = env.DB.prepare(
     `INSERT INTO file_versions
       (entry_id, version, filename, content_type, size, md5, object_key)
      SELECT ?, ?, ?, ?, ?, ?, ?
-     WHERE EXISTS (
+       WHERE EXISTS (
        SELECT 1 FROM entries WHERE id = ? AND COALESCE(version, 1) = ?
-     )`,
+     ) ${reservationGate} ${completionGate}`,
   )
-    .bind(entry.id, nextVersion, entry.filename, contentType, size, md5, objectKey, entry.id, nextVersion);
-  const [updateResult, versionResult] = await env.DB.batch([updateStatement, versionStatement]);
-  if (updateResult.meta.changes !== 1 || versionResult.meta.changes !== 1) {
+    .bind(entry.id, nextVersion, entry.filename, contentType, size, md5, objectKey, entry.id, nextVersion,
+      ...reservationValues, ...completionValues);
+  const statements = [updateStatement, versionStatement];
+  if (reservation) {
+    statements.push(env.DB.prepare(
+      `DELETE FROM saas_storage_reservations
+       WHERE reservation_id = ? AND user_id = ? AND reserved_bytes >= ? AND expires_at > CURRENT_TIMESTAMP
+         AND EXISTS (SELECT 1 FROM entries WHERE id = ? AND COALESCE(version, 1) = ?)
+         ${completionClaim ? "AND EXISTS (SELECT 1 FROM multipart_uploads WHERE upload_id = ? AND complete_token = ?)" : ""}`,
+    ).bind(reservation.id, reservation.ownerId, Math.max(0, Math.floor(reservation.consumeBytes)),
+      entry.id, nextVersion, ...completionValues));
+  }
+  const [updateResult, versionResult, reservationResult] = await env.DB.batch(statements);
+  if (updateResult.meta.changes !== 1 || versionResult.meta.changes !== 1 || (reservation && reservationResult.meta.changes !== 1)) {
     throw new Error("file changed while updating; please reload and try again");
   }
   return nextVersion;
@@ -2802,6 +4102,12 @@ export function isExpired(iso: string | null): boolean {
   return d.getTime() <= Date.now();
 }
 
+async function rejectExpiredEntry(env: Env, entry: EntryRow): Promise<Response | null> {
+  if (!isExpired(entry.expiration_time)) return null;
+  await deleteEntryById(env, entry.id);
+  return json({ error: "file expired" }, 410);
+}
+
 export function parseDateFromUnknown(v: unknown): string | null {
   if (typeof v !== "string" || v.trim() === "") return null;
   const d = new Date(v);
@@ -2818,8 +4124,10 @@ export function escapeHtml(input: string): string {
     .replaceAll("'", "&#39;");
 }
 
-function clipboardKey(slug: string): string {
-  return `${CLIPBOARD_KEY_PREFIX}${slug}`;
+function clipboardKey(slug: string, ownerId?: string | null): string {
+  return ownerId
+    ? `${CLIPBOARD_KEY_PREFIX}saas:${ownerId}:${slug}`
+    : `${CLIPBOARD_KEY_PREFIX}${slug}`;
 }
 
 export function sanitizeClipboardSlug(input: string): string | null {
@@ -2892,25 +4200,62 @@ async function authorizeClipboardRequest(
   return { ok, normalized: provided };
 }
 
-async function getClipboardRecord(env: Env, slug: string): Promise<ClipboardRecord | null> {
-  return env.CLIPBOARD.get(clipboardKey(slug), "json");
+type SaasClipboardMapping = { owner_id: string; slug: string; public_id: string };
+
+async function getSaasClipboardMapping(
+  env: Env,
+  ownerId: string,
+  slug: string,
+): Promise<SaasClipboardMapping | null> {
+  return env.DB.prepare(
+    "SELECT owner_id, slug, public_id FROM saas_clipboards WHERE owner_id = ? AND slug = ?",
+  ).bind(ownerId, slug).first<SaasClipboardMapping>();
 }
 
-async function listClipboards(env: Env): Promise<ClipboardSummary[]> {
-  const keys = await env.CLIPBOARD.list({ prefix: CLIPBOARD_KEY_PREFIX, limit: 1000 });
-  const records = await Promise.all(
-    keys.keys.map(async (entry) => {
-      const slug = entry.name.slice(CLIPBOARD_KEY_PREFIX.length);
-      const record = await getClipboardRecord(env, slug);
+async function ensureSaasClipboardMapping(
+  env: Env,
+  ownerId: string,
+  slug: string,
+  maxClipboards: number | null = null,
+): Promise<SaasClipboardMapping | null> {
+  const current = await getSaasClipboardMapping(env, ownerId, slug);
+  if (current) return current;
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO saas_clipboards(owner_id, slug, public_id)
+     SELECT ?, ?, ?
+     WHERE ? IS NULL OR (SELECT COUNT(*) FROM saas_clipboards WHERE owner_id = ?) < ?`,
+  ).bind(ownerId, slug, crypto.randomUUID().replaceAll("-", ""), maxClipboards, ownerId, maxClipboards).run();
+  const mapping = await getSaasClipboardMapping(env, ownerId, slug);
+  if (!mapping && maxClipboards === null) throw new Error("Could not create clipboard mapping");
+  return mapping;
+}
+
+async function getClipboardRecord(env: Env, slug: string, ownerId?: string | null): Promise<ClipboardRecord | null> {
+  return env.CLIPBOARD.get(clipboardKey(slug, ownerId), "json");
+}
+
+async function listClipboards(env: Env, ownerId?: string | null): Promise<ClipboardSummary[]> {
+  const source = ownerId
+    ? (await env.DB.prepare("SELECT owner_id, slug, public_id FROM saas_clipboards WHERE owner_id = ? ORDER BY created_at DESC")
+        .bind(ownerId).all<SaasClipboardMapping>()).results
+    : (await env.CLIPBOARD.list({ prefix: CLIPBOARD_KEY_PREFIX, limit: 1000 })).keys.map((entry) => ({
+        owner_id: "",
+        slug: entry.name.slice(CLIPBOARD_KEY_PREFIX.length),
+        public_id: "",
+      }));
+  const records: Array<ClipboardSummary | null> = await Promise.all(
+    source.map(async (entry) => {
+      const record = await getClipboardRecord(env, entry.slug, ownerId);
       if (!record) return null;
       const stats = calculateClipboardStats(record.content);
       return {
         slug: record.slug,
+        publicId: entry.public_id || record.publicId,
         updatedAt: record.updatedAt,
         charCount: stats.charCount,
         itemCount: stats.itemCount,
         hasPassword: Boolean(record.passwordHash),
-      } satisfies ClipboardSummary;
+      };
     }),
   );
   return records
@@ -2918,30 +4263,160 @@ async function listClipboards(env: Env): Promise<ClipboardSummary[]> {
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-async function getGuestLinkById(env: Env, id: string): Promise<GuestLinkRow | null> {
+async function getGuestLinkById(env: Env, id: string, ownerId?: string | null): Promise<GuestLinkRow | null> {
   return env.DB.prepare(
-    "SELECT id, label, created_time, max_file_bytes, max_file_lifetime_days, max_file_uploads, url_expires, upload_count FROM guest_links WHERE id = ?",
+    `SELECT id, label, created_time, max_file_bytes, max_file_lifetime_days, max_file_uploads,
+            url_expires, upload_count, owner_id
+     FROM guest_links WHERE id = ?${ownerId ? " AND owner_id = ?" : ""}`,
   )
-    .bind(id)
+    .bind(...(ownerId ? [id, ownerId] : [id]))
     .first<GuestLinkRow>();
 }
 
+async function reserveGuestUploadSlots(env: Env, guestId: string, count: number): Promise<boolean> {
+  const amount = Math.max(1, Math.floor(count));
+  const result = await env.DB.prepare(
+    `UPDATE guest_links
+     SET upload_count = COALESCE(upload_count, 0) + ?
+     WHERE id = ?
+       AND (COALESCE(max_file_uploads, 0) <= 0 OR COALESCE(upload_count, 0) + ? <= max_file_uploads)
+       AND (url_expires IS NULL OR julianday(url_expires) > julianday('now'))`,
+  ).bind(amount, guestId, amount).run();
+  return Number(result.meta.changes || 0) === 1;
+}
+
+async function releaseGuestUploadSlots(env: Env, guestId: string, count: number): Promise<void> {
+  const amount = Math.max(1, Math.floor(count));
+  await env.DB.prepare(
+    "UPDATE guest_links SET upload_count = MAX(COALESCE(upload_count, 0) - ?, 0) WHERE id = ?",
+  ).bind(amount, guestId).run();
+}
+
 async function deleteEntryById(env: Env, id: string): Promise<void> {
-  const versions = await env.DB.prepare(
+  const [versions, currentRows] = await Promise.all([
+    env.DB.prepare(
     "SELECT object_key FROM file_versions WHERE entry_id = ?",
-  )
-    .bind(id)
-    .all<{ object_key: string }>();
+    ).bind(id).all<{ object_key: string }>(),
+    env.DB.prepare("SELECT current_object_key FROM entries WHERE id = ? LIMIT 1")
+      .bind(id).all<{ current_object_key: string | null }>(),
+  ]);
   const objectKeys = new Set(
     versions.results
       .map((version) => version.object_key)
       .filter((objectKey): objectKey is string => Boolean(objectKey) && objectKey !== id),
   );
+  const currentObjectKey = currentRows.results[0]?.current_object_key;
+  if (currentObjectKey && currentObjectKey !== id) objectKeys.add(currentObjectKey);
   for (const objectKey of objectKeys) await env.BUCKET.delete(objectKey);
   await env.BUCKET.delete(id);
   await env.DB.prepare("DELETE FROM download_events WHERE entry_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM file_versions WHERE entry_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM entries WHERE id = ?").bind(id).run();
+}
+
+type AdminActor = { userId: string; email: string };
+type AdminTargetUser = { id: string; name: string | null; email: string };
+
+function isProtectedAdminEmail(env: Env, email: string): boolean {
+  return isSaasSuperadmin(email, env.SAAS_SUPERADMIN_EMAILS);
+}
+
+async function recordAdminAction(
+  env: Env,
+  actor: AdminActor,
+  target: AdminTargetUser,
+  action: string,
+  details: Record<string, unknown>,
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO admin_action_audit
+      (id, actor_user_id, actor_email, target_user_id, target_email, action, details_json, status, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)`,
+  ).bind(
+    crypto.randomUUID(), actor.userId, actor.email, target.id, target.email,
+    action, JSON.stringify(details),
+  ).run();
+}
+
+async function deleteSaasUserData(
+  env: Env,
+  actor: AdminActor,
+  target: AdminTargetUser,
+): Promise<boolean> {
+  let auditId = await env.DB.prepare(
+    `SELECT id FROM admin_action_audit
+     WHERE target_user_id = ? AND action = 'delete_user' AND status = 'started'
+     ORDER BY created_at DESC LIMIT 1`,
+  ).bind(target.id).first<{ id: string }>().then((row) => row?.id || null);
+  if (!auditId) auditId = crypto.randomUUID();
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO deleted_saas_users(user_id, email, deleted_by_user_id, deleted_by_email)
+       VALUES (?, ?, ?, ?)`,
+    ).bind(target.id, target.email, actor.userId, actor.email),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO admin_action_audit
+        (id, actor_user_id, actor_email, target_user_id, target_email, action, details_json, status)
+       VALUES (?, ?, ?, ?, ?, 'delete_user', '{}', 'started')`,
+    ).bind(auditId, actor.userId, actor.email, target.id, target.email),
+  ]);
+
+  // R2, multipart uploads and KV cannot participate in a D1 transaction. Keep
+  // the auth and account rows until these resources are removed so a retry can
+  // resume cleanup if a provider request fails.
+  const entries = await env.DB.prepare(
+    "SELECT id FROM entries WHERE owner_id = ? ORDER BY id LIMIT 10",
+  ).bind(target.id).all<{ id: string }>();
+  for (const entry of entries.results) await deleteEntryById(env, entry.id);
+  if (entries.results.length) return false;
+
+  const uploads = await env.DB.prepare(
+    "SELECT upload_id, entry_id, object_key FROM multipart_uploads WHERE owner_id = ? ORDER BY upload_id LIMIT 10",
+  ).bind(target.id).all<{ upload_id: string; entry_id: string; object_key: string | null }>();
+  for (const upload of uploads.results) {
+    const cleanupToken = generateID();
+    if (!(await claimMultipartCompletion(env, upload.upload_id, target.id, cleanupToken, true))) return false;
+    const removed = await cleanupMultipartUpload(
+      env, upload.upload_id, upload.object_key || upload.entry_id, upload.entry_id,
+      target.id, cleanupToken, true,
+    );
+    if (!removed) return false;
+  }
+  if (uploads.results.length) return false;
+
+  const clipboardPage = await env.CLIPBOARD.list({ prefix: `clipboard:saas:${target.id}:`, limit: 100 });
+  if (clipboardPage.keys.length) {
+    await Promise.all(clipboardPage.keys.map((key) => env.CLIPBOARD.delete(key.name)));
+    return false;
+  }
+
+  const settingsPrefix = `${target.id}:`;
+  const statements = [
+    env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id IN (SELECT upload_id FROM multipart_uploads WHERE owner_id = ?)").bind(target.id),
+    env.DB.prepare("DELETE FROM multipart_uploads WHERE owner_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM guest_links WHERE owner_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM saas_clipboards WHERE owner_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM settings WHERE key IN (?, ?)").bind(`${settingsPrefix}store_forever`, `${settingsPrefix}default_expiration_days`),
+    env.DB.prepare("DELETE FROM download_events WHERE entry_id IN (SELECT id FROM entries WHERE owner_id = ?)").bind(target.id),
+    env.DB.prepare("DELETE FROM file_versions WHERE entry_id IN (SELECT id FROM entries WHERE owner_id = ?)").bind(target.id),
+    env.DB.prepare("DELETE FROM entries WHERE owner_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM apikey WHERE referenceId = ?").bind(target.id),
+    env.DB.prepare('DELETE FROM "session" WHERE userId = ?').bind(target.id),
+    env.DB.prepare('DELETE FROM "account" WHERE userId = ?').bind(target.id),
+    env.DB.prepare("DELETE FROM verification WHERE identifier = ? OR value = ?").bind(target.email, target.id),
+    env.DB.prepare("DELETE FROM admin_pro_grant_audit WHERE user_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM admin_pro_grants WHERE user_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM billing_checkout_attempts WHERE user_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM monthly_usage WHERE user_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM saas_storage_reservations WHERE user_id = ?").bind(target.id),
+    env.DB.prepare("DELETE FROM billing_accounts WHERE user_id = ?").bind(target.id),
+    env.DB.prepare('DELETE FROM "user" WHERE id = ?').bind(target.id),
+    env.DB.prepare("UPDATE admin_action_audit SET status = 'completed', details_json = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?")
+      .bind(JSON.stringify({ cleanup: "complete" }), auditId),
+  ];
+  await env.DB.batch(statements);
+  return true;
 }
 
 export async function cleanupExpiredEntries(
@@ -3296,6 +4771,29 @@ function guestUploadPage(link: GuestLinkRow, message: string | null, isError: bo
       h1 { font-size: 34px; }
       .drop-zone { min-height: 170px; }
     }
+    body { padding: 0 24px; color: #111; background: #f6f5f4; font: 16px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .wrap { max-width: 1280px; padding: 16px 0 28px; }
+    .back-link { color: #0075de; border: 0; border-radius: 8px; background: #e6f3fe; }
+    .back-link:hover { background: #d8edfc; transform: none; }
+    .top-nav .back-link:first-child::before { content: ""; display: inline-block; flex: 0 0 22px; width: 22px; height: 22px; background: url("/favicon.svg") center / contain no-repeat; }
+    h1 { color: #111; font-size: clamp(40px,4.5vw,56px); font-weight: 600; line-height: 1.08; letter-spacing: -.04em; }
+    .hint { color: #615d59; }
+    .flash { border-radius: 8px; backdrop-filter: none; }
+    label { color: #615d59; }
+    input, textarea { color: #111; border-color: rgba(0,0,0,.16); border-radius: 8px; background: #fff; backdrop-filter: none; }
+    input:focus, textarea:focus { border-color: #0075de; box-shadow: 0 0 0 3px rgba(0,117,222,.12); }
+    .drop-zone { color: #111; border-color: rgba(0,0,0,.2); border-radius: 12px; background: #fff; }
+    .drop-zone.dragover { border-color: #0075de; background: #e6f3fe; box-shadow: none; }
+    .dz-secondary { color: #615d59; }
+    .dz-list { color: #615d59; border-color: rgba(0,0,0,.08); border-radius: 8px; background: #f6f5f4; }
+    button[type="submit"] { color: #fff; border: 1px solid #0075de; border-radius: 8px; background: #0075de; transition: background-color .2s ease; }
+    button[type="submit"]::before { display: none; }
+    button[type="submit"]:hover { color: #fff; background: #0068c7; transform: none; }
+    .busy-card { color: #111; border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; box-shadow: 0 4px 12px rgba(0,0,0,.1); }
+    .busy-spinner { border-color: rgba(0,117,222,.18); border-top-color: #0075de; }
+    @media (max-width: 980px) { body { padding: 0 16px; } .wrap { padding: 16px 0 24px; } }
+    @media (max-width: 600px) { body { font-size: 16px; line-height: 1.6; } h1 { font-size: clamp(30px, 8vw, 38px); line-height: 1.12; } h2 { font-size: 23px; } .hint, label, input, button, .flash { font-size: 15px; } .wrap { padding: 14px 0 22px; } }
+    @media (max-width: 360px) { body { padding: 0 12px; } h1 { font-size: 29px; } }
   </style>
 </head>
 <body>
@@ -3418,14 +4916,14 @@ function guestUploadPage(link: GuestLinkRow, message: string | null, isError: bo
 </html>`;
 }
 
-function clipboardListPage(): string {
+function clipboardListPage(_saasMode = false): string {
   return `<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <title>云便签 - 列表</title>
+  <title>Clip Notes | PicoShare</title>
   <style>
     :root {
       --bg: #eef1f8;
@@ -3458,6 +4956,7 @@ function clipboardListPage(): string {
       margin-bottom: 14px;
       padding: 2px 2px 8px;
     }
+    .head-right { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
     h1 { margin: 0; font-size: 44px; letter-spacing: 0.2px; }
     .new { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     input {
@@ -3512,6 +5011,10 @@ function clipboardListPage(): string {
       backdrop-filter: blur(10px);
       overflow: hidden;
     }
+    .bulk-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
+    .bulk-toolbar[hidden] { display: none; }
+    .selection-cell { width: 44px; text-align: center; }
+    table input[type="checkbox"] { width: 16px; height: 16px; min-width: 16px; margin: 0; padding: 0; accent-color: var(--primary); cursor: pointer; }
     table { width: 100%; border-collapse: collapse; font-size: 15px; background: rgba(255, 255, 255, 0.2); }
     th, td {
       padding: 12px 12px;
@@ -3524,74 +5027,318 @@ function clipboardListPage(): string {
     a { color: #2b5cc9; text-decoration: none; font-weight: 600; }
     @media (max-width: 980px) {
       body { padding: 10px; }
+      .head { align-items: flex-start; flex-direction: column; }
+      .head-right { justify-content: flex-start; width: 100%; }
       h1 { font-size: 34px; }
-      input { min-width: 220px; }
+      input { min-width: 0; }
     }
+    :root { --bg: #f6f5f4; --bg-2: #f6f5f4; --text: #111; --muted: #615d59; --line: rgba(0,0,0,.08); --line-soft: rgba(0,0,0,.08); --primary: #0075de; }
+    body { padding: 0 24px; color: #111; background: #f6f5f4; font: 16px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .wrap { max-width: 1280px; }
+    .head { padding: 22px 0 12px; }
+    .page-nav { display: inline-flex; align-items: center; gap: 8px; }
+    .page-nav a { display: inline-flex; align-items: center; min-height: 40px; padding: 0 13px; border-radius: 8px; color: #0075de; background: #e6f3fe; font-size: 14px; font-weight: 600; text-decoration: none; }
+    .page-nav a:hover { background: #d8edfc; }
+    h1 { color: #111; font-size: clamp(40px,4.5vw,56px); font-weight: 600; line-height: 1.08; letter-spacing: -.04em; }
+    input { color: #111; border-color: rgba(0,0,0,.16); border-radius: 8px; background: #fff; backdrop-filter: none; }
+    input:focus { border-color: #0075de; box-shadow: 0 0 0 3px rgba(0,117,222,.12); }
+    button { color: #0075de; border: 1px solid transparent; border-radius: 8px; background: #e6f3fe; transition: color .2s ease, background-color .2s ease; }
+    button::before { display: none; }
+    button:hover { color: #005fb8; background: #d8edfc; transform: none; }
+    #go { color: #fff; background: #0075de; }
+    #go:hover { color: #fff; background: #0068c7; }
+    .card { border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; backdrop-filter: none; }
+    table { background: #fff; }
+    th, td { border-bottom-color: rgba(0,0,0,.08); }
+    th { color: #615d59; }
+    .muted { color: #615d59; }
+    a { color: #0075de; }
+    @media (max-width: 980px) { body { padding: 0 16px; } }
+    @media (max-width: 600px) { body { font-size: 16px; line-height: 1.6; } h1 { font-size: clamp(30px, 8vw, 38px); line-height: 1.12; } h2 { font-size: 23px; } p, li, th, td, button, input, .muted { font-size: 15px; } .page-nav a { min-height: 42px; font-size: 14px; } }
+    @media (max-width: 360px) { body { padding: 0 12px; } h1 { font-size: 29px; } }
   </style>
 </head>
 <body>
   <main class="wrap">
     <div class="head">
-      <h1>云便签列表</h1>
-      <div class="new">
-        <input id="name" type="text" maxlength="64" placeholder="输入名字，例如：zhangsan" />
-        <button id="go" type="button">打开/创建便签</button>
+      <h1 data-i18n="page_title">Clip Notes</h1>
+      <div class="head-right">
+        <nav class="page-nav" aria-label="主导航"><a href="/" data-i18n="home">主页</a><a href="/app" data-i18n="upload_files">上传文件</a></nav>
+        <button id="lang-toggle" type="button">中文</button>
+        <div class="new">
+          <input id="name" type="text" maxlength="64" data-i18n-placeholder="name_placeholder" placeholder="Enter a name, e.g. zhangsan" />
+          <button id="go" type="button" data-i18n="open_create">Open / create note</button>
+        </div>
       </div>
+    </div>
+    <div class="bulk-toolbar" id="bulk-toolbar" hidden>
+      <span class="muted" id="selected-count"></span>
+      <button id="delete-selected" type="button" data-i18n="delete_selected_notes"></button>
     </div>
     <div class="card">
       <table>
         <thead>
           <tr>
-            <th>名称</th>
-            <th>最近更新</th>
-            <th>保护</th>
-            <th>便签项</th>
-            <th>字符</th>
-            <th>操作</th>
+            <th class="selection-cell" id="select-heading" hidden><input id="select-all" type="checkbox" /></th>
+            <th data-i18n="name">Name</th>
+            <th data-i18n="last_updated">Last updated</th>
+            <th data-i18n="protection">Protection</th>
+            <th data-i18n="items">Items</th>
+            <th data-i18n="characters">Characters</th>
+            <th data-i18n="actions">Actions</th>
           </tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="6" class="muted">加载中...</td></tr>
+          <tr><td colspan="7" class="muted">Loading...</td></tr>
         </tbody>
       </table>
     </div>
   </main>
   <script>
     (function() {
+      var I18N = {
+        en: {
+          document_title: "Clip Notes | PicoShare",
+          page_title: "Clip Notes",
+          home: "Home",
+          upload_files: "Upload files",
+          language_switch: "中文",
+          name_placeholder: "Enter a name, e.g. zhangsan",
+          open_create: "Open / create note",
+          name: "Name",
+          last_updated: "Last updated",
+          protection: "Protection",
+          items: "Items",
+          characters: "Characters",
+          actions: "Actions",
+          loading: "Loading...",
+          empty: "No notes yet. Enter a name above to create one.",
+          load_failed: "Could not load notes. Please refresh and try again.",
+          encrypted: "Encrypted",
+          public: "Public",
+          open: "Open",
+          remove: "Delete",
+          delete_confirm: "Delete note {name} and its share link?",
+          delete_failed: "Could not delete this note. Please try again.",
+          select_all_notes: "Select all notes",
+          select_note: "Select note {name}",
+          notes_selected_count: "{count} selected",
+          delete_selected_notes: "Delete selected",
+          delete_selected_notes_confirm: "Delete {count} selected notes and their share links? This cannot be undone.",
+          notes_deleted_count: "Deleted {count} notes.",
+          notes_delete_partial: "Deleted {deleted} notes; {failed} failed."
+        },
+        zh: {
+          document_title: "云便签 - 列表",
+          page_title: "云便签列表",
+          home: "主页",
+          upload_files: "上传文件",
+          language_switch: "EN",
+          name_placeholder: "输入名字，例如：zhangsan",
+          open_create: "打开/创建便签",
+          name: "名称",
+          last_updated: "最近更新",
+          protection: "保护",
+          items: "便签项",
+          characters: "字符",
+          actions: "操作",
+          loading: "加载中...",
+          empty: "暂无便签，右上角输入名字即可创建。",
+          load_failed: "便签加载失败，请刷新页面重试。",
+          encrypted: "已加密",
+          public: "公开",
+          open: "进入",
+          remove: "删除",
+          delete_confirm: "确定删除便签 {name} 和它的分享链接吗？",
+          delete_failed: "便签删除失败，请重试。",
+          select_all_notes: "全选云便签",
+          select_note: "选择便签 {name}",
+          notes_selected_count: "已选择 {count} 个",
+          delete_selected_notes: "批量删除",
+          delete_selected_notes_confirm: "确认删除选中的 {count} 个便签及其分享链接吗？删除后无法恢复。",
+          notes_deleted_count: "已删除 {count} 个便签。",
+          notes_delete_partial: "已删除 {deleted} 个便签，{failed} 个失败。"
+        }
+      };
+      var lang = localStorage.getItem("ps_lang") === "zh" ? "zh" : "en";
+      var canDelete = ${_saasMode ? "true" : "false"};
+      var listState = { status: "loading", data: [] };
+      var selectedSlugs = new Set();
+      var selectAllCheckbox = document.getElementById("select-all");
+      var bulkToolbar = document.getElementById("bulk-toolbar");
+      var selectedCountLabel = document.getElementById("selected-count");
+      var deleteSelectedButton = document.getElementById("delete-selected");
+      function t(key) {
+        return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
+      }
       function formatDate(iso) {
         if (!iso) return "-";
         var d = new Date(iso);
         if (Number.isNaN(d.getTime())) return iso;
-        return d.toLocaleString();
+        return d.toLocaleString(lang === "zh" ? "zh-CN" : "en-US");
       }
       function normalize(value) {
         return (value || "").trim().toLowerCase().replace(/\\s+/g, "-");
       }
-      async function loadList() {
+      function updateBulkUI() {
+        var available = new Set(listState.data.map(function(item) { return String(item.slug || ""); }));
+        selectedSlugs.forEach(function(slug) { if (!available.has(slug)) selectedSlugs.delete(slug); });
+        var selectedCount = selectedSlugs.size;
+        var selectedOnList = listState.data.filter(function(item) { return selectedSlugs.has(String(item.slug || "")); }).length;
+        document.getElementById("select-heading").hidden = !canDelete;
+        bulkToolbar.hidden = !canDelete || listState.status !== "loaded" || selectedCount === 0;
+        selectedCountLabel.textContent = t("notes_selected_count").replace("{count}", String(selectedCount));
+        deleteSelectedButton.disabled = selectedCount === 0;
+        selectAllCheckbox.disabled = !canDelete || !listState.data.length;
+        selectAllCheckbox.checked = listState.data.length > 0 && selectedOnList === listState.data.length;
+        selectAllCheckbox.indeterminate = selectedOnList > 0 && selectedOnList < listState.data.length;
+        selectAllCheckbox.setAttribute("aria-label", t("select_all_notes"));
+      }
+      function renderMessage(text) {
         var rows = document.getElementById("rows");
+        var tr = document.createElement("tr");
+        var td = document.createElement("td");
+        td.colSpan = canDelete ? 7 : 6;
+        td.className = "muted";
+        td.textContent = text;
+        tr.appendChild(td);
+        rows.replaceChildren(tr);
+      }
+      selectAllCheckbox.addEventListener("change", function() {
+        listState.data.forEach(function(item) {
+          var slug = String(item.slug || "");
+          if (selectAllCheckbox.checked) selectedSlugs.add(slug);
+          else selectedSlugs.delete(slug);
+        });
+        renderList();
+      });
+      deleteSelectedButton.addEventListener("click", async function() {
+        var slugs = Array.from(selectedSlugs);
+        if (!slugs.length) return;
+        var message = t("delete_selected_notes_confirm").replace("{count}", String(slugs.length));
+        if (!confirm(message)) return;
+        deleteSelectedButton.disabled = true;
+        var deleted = 0;
+        var failed = 0;
+        for (var i = 0; i < slugs.length; i += 1) {
+          try {
+            var response = await fetch("/clipboard-api/item/" + encodeURIComponent(slugs[i]), { method: "DELETE" });
+            if (!response.ok) throw new Error("delete failed");
+            selectedSlugs.delete(slugs[i]);
+            deleted += 1;
+          } catch (_) {
+            failed += 1;
+          }
+        }
+        await loadList();
+        alert(failed
+          ? t("notes_delete_partial").replace("{deleted}", String(deleted)).replace("{failed}", String(failed))
+          : t("notes_deleted_count").replace("{count}", String(deleted)));
+      });
+      function renderList() {
+        updateBulkUI();
+        if (listState.status === "loading") {
+          renderMessage(t("loading"));
+          return;
+        }
+        if (listState.status === "error") {
+          renderMessage(t("load_failed"));
+          return;
+        }
+        if (!listState.data.length) {
+          renderMessage(t("empty"));
+          return;
+        }
+        var rows = document.getElementById("rows");
+        rows.replaceChildren();
+        listState.data.forEach(function(item) {
+          var name = String(item.slug || "");
+          var href = "/" + encodeURIComponent(name);
+          var tr = document.createElement("tr");
+          var selectCell = document.createElement("td");
+          selectCell.className = "selection-cell";
+          selectCell.hidden = !canDelete;
+          if (canDelete) {
+            var checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.checked = selectedSlugs.has(name);
+            checkbox.setAttribute("aria-label", t("select_note").replace("{name}", name));
+            checkbox.addEventListener("change", function() {
+              if (checkbox.checked) selectedSlugs.add(name);
+              else selectedSlugs.delete(name);
+              updateBulkUI();
+            });
+            selectCell.appendChild(checkbox);
+          }
+          var nameCell = document.createElement("td");
+          var nameLink = document.createElement("a");
+          nameLink.href = href;
+          nameLink.textContent = name;
+          nameCell.appendChild(nameLink);
+          var updatedCell = document.createElement("td");
+          updatedCell.textContent = formatDate(item.updatedAt);
+          var protectionCell = document.createElement("td");
+          protectionCell.textContent = item.hasPassword ? t("encrypted") : t("public");
+          var itemsCell = document.createElement("td");
+          itemsCell.textContent = String(item.itemCount);
+          var charactersCell = document.createElement("td");
+          charactersCell.textContent = String(item.charCount);
+          var actionsCell = document.createElement("td");
+          var openLink = document.createElement("a");
+          openLink.href = href;
+          openLink.textContent = t("open");
+          actionsCell.appendChild(openLink);
+          if (canDelete) {
+            var deleteButton = document.createElement("button");
+            deleteButton.type = "button";
+            deleteButton.textContent = t("remove");
+            deleteButton.addEventListener("click", async function() {
+              if (!confirm(t("delete_confirm").replace("{name}", name))) return;
+              try {
+                var response = await fetch("/clipboard-api/item/" + encodeURIComponent(name), { method: "DELETE" });
+                if (!response.ok) throw new Error("delete failed");
+                await loadList();
+              } catch (_) {
+                alert(t("delete_failed"));
+              }
+            });
+            actionsCell.appendChild(deleteButton);
+          }
+          tr.append(selectCell, nameCell, updatedCell, protectionCell, itemsCell, charactersCell, actionsCell);
+          rows.appendChild(tr);
+        });
+        updateBulkUI();
+      }
+      function applyLanguage() {
+        document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+        document.title = t("document_title");
+        document.querySelectorAll("[data-i18n]").forEach(function(element) {
+          var key = element.getAttribute("data-i18n");
+          element.textContent = t(key);
+        });
+        document.querySelectorAll("[data-i18n-placeholder]").forEach(function(element) {
+          var key = element.getAttribute("data-i18n-placeholder");
+          element.setAttribute("placeholder", t(key));
+        });
+        document.getElementById("lang-toggle").textContent = t("language_switch");
+        selectAllCheckbox.setAttribute("aria-label", t("select_all_notes"));
+        renderList();
+      }
+      async function loadList() {
+        listState.status = "loading";
+        renderList();
         try {
           var res = await fetch("/clipboard-api/list");
-          if (!res.ok) throw new Error(await res.text());
+          if (!res.ok) throw new Error("Request failed");
           var data = await res.json();
-          if (!data.length) {
-            rows.innerHTML = '<tr><td colspan="6" class="muted">暂无便签，右上角输入名字即可创建。</td></tr>';
-            return;
-          }
-          rows.innerHTML = data.map(function(item) {
-            var name = item.slug;
-            var href = "/" + encodeURIComponent(name);
-            return "<tr>" +
-              "<td><a href=\\"" + href + "\\">" + name + "</a></td>" +
-              "<td>" + formatDate(item.updatedAt) + "</td>" +
-              "<td>" + (item.hasPassword ? "已加密" : "公开") + "</td>" +
-              "<td>" + item.itemCount + "</td>" +
-              "<td>" + item.charCount + "</td>" +
-              "<td><a href=\\"" + href + "\\">进入</a></td>" +
-            "</tr>";
-          }).join("");
-        } catch (err) {
-          rows.innerHTML = '<tr><td colspan="6" class="muted">加载失败：' + String((err && err.message) || err) + '</td></tr>';
+          if (!Array.isArray(data)) throw new Error("Invalid list response");
+          listState.data = data;
+          listState.status = "loaded";
+        } catch (_) {
+          listState.data = [];
+          listState.status = "error";
         }
+        renderList();
       }
 
       var nameInput = document.getElementById("name");
@@ -3601,9 +5348,15 @@ function clipboardListPage(): string {
         location.href = "/" + encodeURIComponent(normalized);
       }
       document.getElementById("go").addEventListener("click", go);
+      document.getElementById("lang-toggle").addEventListener("click", function() {
+        lang = lang === "en" ? "zh" : "en";
+        localStorage.setItem("ps_lang", lang);
+        applyLanguage();
+      });
       nameInput.addEventListener("keydown", function(evt) {
         if (evt.key === "Enter") go();
       });
+      applyLanguage();
       loadList();
     })();
   </script>
@@ -3611,14 +5364,20 @@ function clipboardListPage(): string {
 </html>`;
 }
 
-function clipboardDetailPage(slug: string): string {
+function clipboardDetailPage(
+  slug: string,
+  saasMode = false,
+  publicId: string | null = null,
+  publicRoute = false,
+  maxContentBytes: number | null = null,
+): string {
   return `<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <title>云便签 - ${escapeHtml(slug)}</title>
+  <title id="page-title">Cloud note - ${escapeHtml(slug)}</title>
   <style>
     :root {
       --bg: #eef1f8;
@@ -3756,80 +5515,158 @@ function clipboardDetailPage(slug: string): string {
     .stack { display: grid; gap: 8px; }
     .muted { color: var(--muted); font-size: 12px; }
     a { color: #2b5cc9; text-decoration: none; font-weight: 600; }
-    @media (max-width: 960px) {
+    @media (max-width: 980px) {
       body { padding: 10px; }
       .top { padding: 12px; }
       .title { font-size: 22px; }
       .grid { grid-template-columns: 1fr; min-height: auto; }
       textarea { height: 55vh; }
     }
+    :root { --bg: #f6f5f4; --bg-2: #f6f5f4; --text: #111; --muted: #615d59; --line: rgba(0,0,0,.08); --line-soft: rgba(0,0,0,.08); --primary: #0075de; --ok: #0075de; }
+    body { padding: 16px 24px; color: #111; background: #f6f5f4; font: 16px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .top, .grid { max-width: 1280px; }
+    .top { border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; backdrop-filter: none; }
+    .title { color: #111; font-weight: 600; letter-spacing: -.035em; }
+    .title::before { content: ""; display: inline-block; flex: 0 0 32px; width: 32px; height: 32px; background: url("/favicon.svg") center / contain no-repeat; }
+    .title small, .muted { color: #615d59; }
+    .action { flex-wrap: wrap; }
+    .page-nav { display: inline-flex; align-items: center; gap: 8px; }
+    .page-nav a { display: inline-flex; align-items: center; min-height: 40px; padding: 0 13px; border-radius: 8px; color: #0075de; background: #e6f3fe; font-size: 14px; font-weight: 600; text-decoration: none; }
+    .page-nav a:hover { background: #d8edfc; }
+    button { color: #0075de; border-color: transparent; border-radius: 8px; background: #e6f3fe; transition: color .2s ease, background-color .2s ease; }
+    button::before { display: none; }
+    button:hover { color: #005fb8; background: #d8edfc; transform: none; }
+    button.secondary { color: #0075de; border-color: transparent; background: #e6f3fe; }
+    button.secondary:hover { color: #005fb8; background: #d8edfc; }
+    #save { color: #fff; border-color: #0075de; background: #0075de; }
+    #save:hover { color: #fff; background: #0068c7; }
+    .grid { gap: 16px; }
+    .editor-wrap, .card { border-color: rgba(0,0,0,.08); border-radius: 12px; background: #fff; backdrop-filter: none; }
+    textarea { color: #111; background: #fff; }
+    .card h3, .stats b { color: #111; }
+    .link-row input, .stack input[type="text"], .stack input[type="password"], .stack select { color: #111; border-color: rgba(0,0,0,.16); border-radius: 8px; background: #fff; }
+    .link-row input:focus, .stack input[type="text"]:focus, .stack input[type="password"]:focus, .stack select:focus { border-color: #0075de; box-shadow: 0 0 0 3px rgba(0,117,222,.12); }
+    a { color: #0075de; }
+    @media (max-width: 980px) { body { padding: 12px 16px; } .top { flex-wrap: wrap; } .action { width: 100%; justify-content: flex-start; } }
+    @media (max-width: 600px) { body { padding: 12px; font-size: 16px; line-height: 1.6; } h1 { font-size: clamp(30px, 8vw, 38px); line-height: 1.12; } .card h3 { font-size: 17px; } .muted { font-size: 14px; } button, input, select, label { font-size: 15px; } .top { gap: 10px; } .action { gap: 8px; } }
+    @media (max-width: 360px) { body { padding: 10px; } h1 { font-size: 29px; } }
   </style>
 </head>
 <body>
   <header class="top">
-    <div class="title">云便签 <small>/${escapeHtml(slug)}</small></div>
+    <div class="title"><span id="brand-title" data-i18n="title">Cloud note</span> <small>/${escapeHtml(slug)}</small></div>
     <div class="action">
-      <button id="copy-link" class="secondary" type="button">复制链接</button>
-      <button id="save" type="button">保存</button>
+      <nav class="page-nav" aria-label="Primary navigation"><a href="/" data-i18n="home">Home</a><a href="/app" data-i18n="upload">Upload files</a></nav>
+      <button id="lang-toggle" class="secondary" type="button" aria-label="Switch to Chinese">中文</button>
+      <button id="copy-link" class="secondary" type="button" data-i18n="copy_link">Copy link</button>
+      <button id="save" type="button" data-i18n="save">Save</button>
       <span id="msg" class="msg"></span>
     </div>
   </header>
   <main class="grid">
     <section class="editor-wrap">
-      <textarea id="content" placeholder="可以随便记录点什么，支持多设备同步编辑。"></textarea>
+      <textarea id="content" placeholder="Write a note and keep it in sync across devices." data-i18n-placeholder="content_placeholder"></textarea>
     </section>
     <aside class="side">
       <section class="card">
-        <h3>统计信息</h3>
+        <h3 data-i18n="statistics">Statistics</h3>
         <div class="stats">
-          <div><b id="item-count">0</b><span>便签项</span></div>
-          <div><b id="line-count">0</b><span>行数</span></div>
-          <div><b id="char-count">0</b><span>字符</span></div>
+          <div><b id="item-count">0</b><span data-i18n="items">Items</span></div>
+          <div><b id="line-count">0</b><span data-i18n="lines">Lines</span></div>
+          <div><b id="char-count">0</b><span data-i18n="characters">Characters</span></div>
         </div>
       </section>
       <section class="card">
-        <h3>分享</h3>
+        <h3 data-i18n="sharing">Sharing</h3>
         <div class="link-row">
           <input id="url" readonly />
-          <button id="copy-url" class="secondary" type="button">复制</button>
+          <button id="copy-url" class="secondary" type="button" data-i18n="copy">Copy</button>
         </div>
-        <p class="muted">复制此地址后，可在多台设备打开并编辑保存。</p>
+        <p class="muted" data-i18n="sharing_help">Open this address on your devices to edit and save the note.</p>
       </section>
       <section class="card">
-        <h3>密码保护</h3>
+        <h3 data-i18n="password_protection">Password protection</h3>
         <div class="stack">
-          <input id="unlock-password" type="password" maxlength="128" placeholder="当前密码（若已加密）" />
+          <input id="unlock-password" type="password" maxlength="128" placeholder="Current password (if protected)" data-i18n-placeholder="current_password" />
           <div class="link-row">
-            <button id="unlock-btn" class="secondary" type="button">解锁</button>
-            <span id="lock-state" class="muted">状态：未加密</span>
+            <button id="unlock-btn" class="secondary" type="button" data-i18n="unlock">Unlock</button>
+            <span id="lock-state" class="muted"></span>
           </div>
-          <input id="new-password" type="password" maxlength="128" placeholder="新密码（留空为取消密码）" />
-          <button id="set-password-btn" type="button">设置/更新密码</button>
+          <input id="new-password" type="password" maxlength="128" placeholder="New password (leave blank to remove protection)" data-i18n-placeholder="new_password" />
+          <button id="set-password-btn" type="button" data-i18n="set_password">Set / update password</button>
         </div>
       </section>
       <section class="card">
-        <h3>剪贴板列表</h3>
-        <a href="/clips">打开列表页</a>
+        <h3 data-i18n="notes_list">Notes list</h3>
+        <a href="/clips" data-i18n="open_list">Open list</a>
       </section>
     </aside>
   </main>
   <script>
     (function() {
       var slug = ${JSON.stringify(slug)};
+      var publicId = ${JSON.stringify(publicId)};
+      var lang = localStorage.getItem("ps_lang") === "zh" ? "zh" : "en";
+      var I18N = {
+        en: {
+          document_title: "Cloud note - {slug}", title: "Cloud note", home: "Home", upload: "Upload files", copy_link: "Copy link", save: "Save",
+          statistics: "Statistics", items: "Items", lines: "Lines", characters: "Characters", sharing: "Sharing",
+          sharing_help: "Open this address on your devices to edit and save the note.", copy: "Copy", password_protection: "Password protection",
+          current_password: "Current password (if protected)", unlock: "Unlock", new_password: "New password (leave blank to remove protection)", set_password: "Set / update password",
+          notes_list: "Notes list", open_list: "Open list", content_placeholder: "Write a note and keep it in sync across devices.", switch_language: "Switch to Chinese",
+          encrypted: "Status: password protected", not_encrypted: "Status: not protected", encrypted_unlock: "This note is protected. Enter its password to unlock it.",
+          plan_limit_upload: "This note exceeds your plan limit. Upload it as a file instead.", content_too_long: "The note is too long.", wrong_password: "The password is incorrect or missing.",
+          current_password_wrong: "The current password is incorrect.", saved: "Saved", auto_saved: "Saved automatically when you left the page.", unlocked: "Unlocked",
+          password_updated: "Password updated", password_removed: "Password protection removed", copied: "Copied", note_limit_reached: "You have reached the note limit for this plan."
+        },
+        zh: {
+          document_title: "云便签 - {slug}", title: "云便签", home: "主页", upload: "上传文件", copy_link: "复制链接", save: "保存",
+          statistics: "统计信息", items: "便签项", lines: "行数", characters: "字符", sharing: "分享",
+          sharing_help: "复制此地址后，可在多台设备打开并编辑保存。", copy: "复制", password_protection: "密码保护",
+          current_password: "当前密码（若已加密）", unlock: "解锁", new_password: "新密码（留空为取消密码）", set_password: "设置/更新密码",
+          notes_list: "剪贴板列表", open_list: "打开列表页", content_placeholder: "可以随便记录点什么，支持多设备同步编辑。", switch_language: "Switch to English",
+          encrypted: "状态：已加密", not_encrypted: "状态：未加密", encrypted_unlock: "该便签已加密，请输入密码后解锁",
+          plan_limit_upload: "便签内容超出套餐限制，请上传为文件", content_too_long: "内容过长", wrong_password: "密码错误或未提供密码",
+          current_password_wrong: "当前密码错误", saved: "已保存", auto_saved: "鼠标移出已自动保存", unlocked: "已解锁",
+          password_updated: "密码已更新", password_removed: "密码已取消", copied: "已复制", note_limit_reached: "已达到当前套餐的云便签数量上限。"
+        }
+      };
+      function t(key) { return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key; }
+      function applyLanguage() {
+        document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+        document.title = t("document_title").replace("{slug}", slug);
+        document.querySelectorAll("[data-i18n]").forEach(function(element) { element.textContent = t(element.getAttribute("data-i18n")); });
+        document.querySelectorAll("[data-i18n-placeholder]").forEach(function(element) { element.placeholder = t(element.getAttribute("data-i18n-placeholder")); });
+        var toggle = document.getElementById("lang-toggle");
+        toggle.textContent = lang === "zh" ? "EN" : "中文";
+        toggle.setAttribute("aria-label", t("switch_language"));
+      }
+      var itemApiPath = ${JSON.stringify(publicRoute
+        ? `/clipboard-api/public/${publicId || ""}`
+        : `/clipboard-api/item/${slug}`)};
+      var isSaas = ${saasMode ? "true" : "false"};
+      var isPublicRoute = ${publicRoute ? "true" : "false"};
+      var maxContentBytes = ${JSON.stringify(maxContentBytes)};
       var contentEl = document.getElementById("content");
       var msgEl = document.getElementById("msg");
       var urlEl = document.getElementById("url");
       var unlockPasswordEl = document.getElementById("unlock-password");
       var newPasswordEl = document.getElementById("new-password");
       var lockStateEl = document.getElementById("lock-state");
-      var passwordStorageKey = ${JSON.stringify(clipboardPasswordStorageKey(slug))};
+      var passwordStorageKey = ${JSON.stringify(clipboardPasswordStorageKey(saasMode ? (publicId || "saas:" + slug) : slug))};
       var clipPassword = "";
       var hasPassword = false;
       var isDirty = false;
       var isSaving = false;
       var lastSavedContent = "";
       var autoSaveTimer = null;
-      urlEl.value = location.origin + "/" + encodeURIComponent(slug);
+      if (isPublicRoute) {
+        contentEl.readOnly = true;
+        document.getElementById("save").classList.add("hidden");
+        document.getElementById("set-password-btn").classList.add("hidden");
+        newPasswordEl.classList.add("hidden");
+      }
+      urlEl.value = location.origin + (isSaas && publicId ? "/c/" + encodeURIComponent(publicId) : "/" + encodeURIComponent(slug));
 
       function persistPassword(value) {
         try {
@@ -3851,8 +5688,20 @@ function clipboardDetailPage(slug: string): string {
         setTimeout(function() { msgEl.textContent = ""; }, 1600);
       }
 
+      async function responseError(res) {
+        var raw = await res.text();
+        var message = raw;
+        try {
+          var body = JSON.parse(raw);
+          if (body && typeof body.error === "string") message = body.error;
+        } catch {}
+        if (message === "clipboard limit reached") return new Error(t("note_limit_reached"));
+        if (message === "clipboard exceeds plan limit") return new Error(t("plan_limit_upload"));
+        return new Error(message || "Request failed");
+      }
+
       function setLockState() {
-        lockStateEl.textContent = hasPassword ? "状态：已加密" : "状态：未加密";
+        lockStateEl.textContent = hasPassword ? t("encrypted") : t("not_encrypted");
       }
 
       function authHeaders() {
@@ -3873,7 +5722,7 @@ function clipboardDetailPage(slug: string): string {
       async function load() {
         var headers = {};
         if (clipPassword) headers["x-clip-password"] = clipPassword;
-        var res = await fetch("/clipboard-api/item/" + encodeURIComponent(slug), { headers: headers });
+        var res = await fetch(itemApiPath, { headers: headers });
         if (res.status === 401) {
           hasPassword = true;
           if (clipPassword) {
@@ -3882,10 +5731,23 @@ function clipboardDetailPage(slug: string): string {
             persistPassword("");
           }
           setLockState();
-          throw new Error("该便签已加密，请输入密码后解锁");
+          throw new Error(t("encrypted_unlock"));
         }
-        if (!res.ok) throw new Error(await res.text());
+        if (!res.ok) throw await responseError(res);
         var data = await res.json();
+        if (typeof data.maxContentBytes === "number") maxContentBytes = data.maxContentBytes;
+        if (isSaas && data.publicId) urlEl.value = location.origin + "/c/" + encodeURIComponent(data.publicId);
+        if (isPublicRoute) contentEl.readOnly = !data.canEdit;
+        if (isPublicRoute && data.canEdit) {
+          document.getElementById("save").classList.remove("hidden");
+          document.getElementById("set-password-btn").classList.remove("hidden");
+          newPasswordEl.classList.remove("hidden");
+        }
+        if (isPublicRoute && !data.canEdit) {
+          document.getElementById("save").classList.add("hidden");
+          document.getElementById("set-password-btn").classList.add("hidden");
+          newPasswordEl.classList.add("hidden");
+        }
         hasPassword = !!data.hasPassword;
         if (!hasPassword) persistPassword("");
         else if (clipPassword) persistPassword(clipPassword);
@@ -3906,13 +5768,14 @@ function clipboardDetailPage(slug: string): string {
       async function save(silent) {
         if (isSaving) return;
         var text = String(contentEl.value || "");
-        if (text.length > ${MAX_CLIPBOARD_CHARS}) {
-          if (!silent) setMsg("内容过长");
+        var textBytes = new TextEncoder().encode(text).byteLength;
+        if ((maxContentBytes !== null && textBytes > maxContentBytes) || (!isSaas && text.length > ${MAX_CLIPBOARD_CHARS})) {
+          if (!silent) setMsg(isSaas ? t("plan_limit_upload") : t("content_too_long"));
           return;
         }
         if (!isDirty && text === lastSavedContent) return;
         isSaving = true;
-        var res = await fetch("/clipboard-api/item/" + encodeURIComponent(slug), {
+        var res = await fetch(itemApiPath, {
           method: "PUT",
           headers: authHeaders(),
           body: JSON.stringify({ content: text }),
@@ -3922,25 +5785,27 @@ function clipboardDetailPage(slug: string): string {
           unlockPasswordEl.value = "";
           persistPassword("");
           isSaving = false;
-          throw new Error("密码错误或未提供密码");
+          throw new Error(t("wrong_password"));
         }
         if (!res.ok) {
           isSaving = false;
-          throw new Error(await res.text());
+          throw await responseError(res);
         }
         var data = await res.json();
+        if (typeof data.maxContentBytes === "number") maxContentBytes = data.maxContentBytes;
         hasPassword = !!data.hasPassword;
+        if (isSaas && data.publicId) urlEl.value = location.origin + "/c/" + encodeURIComponent(data.publicId);
         isSaving = false;
         isDirty = false;
         lastSavedContent = text;
         setLockState();
-        if (!silent) setMsg("已保存");
+        if (!silent) setMsg(t("saved"));
       }
 
       function saveOnMouseLeave() {
         if (!isDirty) return;
         save(false).then(function() {
-          setMsg("鼠标移出已自动保存");
+          setMsg(t("auto_saved"));
         }).catch(function(err) {
           setMsg(String((err && err.message) || err));
         });
@@ -3950,13 +5815,13 @@ function clipboardDetailPage(slug: string): string {
         clipPassword = String(unlockPasswordEl.value || "").trim();
         await load();
         if (clipPassword) persistPassword(clipPassword);
-        setMsg("已解锁");
+        setMsg(t("unlocked"));
       }
 
       async function updatePassword() {
         var currentPassword = String(unlockPasswordEl.value || "").trim();
         var nextPassword = String(newPasswordEl.value || "").trim();
-        var res = await fetch("/clipboard-api/item/" + encodeURIComponent(slug) + "/password", {
+        var res = await fetch(itemApiPath + "/password", {
           method: "PUT",
           headers: authHeaders(),
           body: JSON.stringify({
@@ -3964,10 +5829,11 @@ function clipboardDetailPage(slug: string): string {
             newPassword: nextPassword || null,
           }),
         });
-        if (res.status === 401) throw new Error("当前密码错误");
-        if (!res.ok) throw new Error(await res.text());
+        if (res.status === 401) throw new Error(t("current_password_wrong"));
+        if (!res.ok) throw await responseError(res);
         var data = await res.json();
         hasPassword = !!data.hasPassword;
+        if (isSaas && data.publicId) urlEl.value = location.origin + "/c/" + encodeURIComponent(data.publicId);
         if (nextPassword) {
           clipPassword = nextPassword;
           unlockPasswordEl.value = nextPassword;
@@ -3979,9 +5845,15 @@ function clipboardDetailPage(slug: string): string {
         }
         newPasswordEl.value = "";
         setLockState();
-        setMsg(hasPassword ? "密码已更新" : "密码已取消");
+        setMsg(hasPassword ? t("password_updated") : t("password_removed"));
       }
 
+      document.getElementById("lang-toggle").addEventListener("click", function() {
+        lang = lang === "zh" ? "en" : "zh";
+        localStorage.setItem("ps_lang", lang);
+        applyLanguage();
+        setLockState();
+      });
       contentEl.addEventListener("input", function() {
         isDirty = true;
         updateStats();
@@ -4010,10 +5882,10 @@ function clipboardDetailPage(slug: string): string {
         updatePassword().catch(function(err) { setMsg(String((err && err.message) || err)); });
       });
       document.getElementById("copy-url").addEventListener("click", function() {
-        navigator.clipboard.writeText(urlEl.value).then(function() { setMsg("已复制"); });
+        navigator.clipboard.writeText(urlEl.value).then(function() { setMsg(t("copied")); });
       });
       document.getElementById("copy-link").addEventListener("click", function() {
-        navigator.clipboard.writeText(urlEl.value).then(function() { setMsg("已复制"); });
+        navigator.clipboard.writeText(urlEl.value).then(function() { setMsg(t("copied")); });
       });
       document.addEventListener("mouseleave", saveOnMouseLeave);
       document.addEventListener("visibilitychange", function() {
@@ -4022,6 +5894,7 @@ function clipboardDetailPage(slug: string): string {
         }
       });
 
+      applyLanguage();
       setLockState();
       load().catch(function(err) { setMsg(String((err && err.message) || err)); });
     })();
@@ -4032,12 +5905,103 @@ function clipboardDetailPage(slug: string): string {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    await ensureSchemaOnce(env);
-
     const url = new URL(request.url);
+
+    // Serve static assets only for safe read requests. Forwarding a POST request
+    // to ASSETS consumes/locks its body stream, which breaks downstream handlers
+    // such as Better Auth email registration even when ASSETS returns 404.
+    if (url.pathname === "/robots.txt" && (request.method === "GET" || request.method === "HEAD")) {
+      const body = request.method === "HEAD" ? null : "User-agent: *\nAllow: /\nDisallow: /-\nDisallow: /_preview/\nDisallow: /c/\nDisallow: /clipboard-api/public/\nDisallow: /guest/\nDisallow: /api/\nDisallow: /app\nDisallow: /upload\nDisallow: /account\nDisallow: /clips\nDisallow: /api-docs\nDisallow: /privacy\nDisallow: /downloads/\nDisallow: /videos/\nDisallow: /*?\n";
+      return new Response(body, {
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600", "X-Robots-Tag": "noindex, nofollow, noarchive" },
+      });
+    }
+
+    if ((request.method === "GET" || request.method === "HEAD") && url.pathname !== "/") {
+      const assetResponse = await env.ASSETS.fetch(request);
+      if (assetResponse.status !== 404) {
+        const headers = new Headers(assetResponse.headers);
+        headers.set("X-Robots-Tag", "noindex, nofollow, noarchive");
+        return new Response(assetResponse.body, { status: assetResponse.status, statusText: assetResponse.statusText, headers });
+      }
+    }
+
+    if (url.pathname === "/privacy" && request.method === "GET") {
+      return new Response(privacyPolicyPage(url.searchParams.get("lang")), {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow, noarchive" },
+      });
+    }
+    const saasEnabled = isSaasEnabled(env.ENABLE_SAAS);
+    const googleLoginEnabled = Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
+    let auth: ReturnType<typeof createAuth> | null = null;
+
+    if (saasEnabled) {
+      try {
+        auth = createAuth(env, request.url);
+      } catch (err) {
+        return json({ error: String((err as Error)?.message || err) }, 503);
+      }
+    }
+
+    await ensureSchemaOnce(env, auth || undefined);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: withCors() });
+    }
+
+    if (auth && url.pathname.startsWith("/api/auth")) {
+      if (url.pathname === "/api/auth/api-key/create" && request.method === "POST") {
+        return json({ error: "Create API Keys through POST /api/api-keys" }, 403);
+      }
+      return auth.handler(request);
+    }
+
+    if (url.pathname === "/api/session" && request.method === "GET") {
+      if (!auth) return jsonNoStore({ user: null, saasEnabled: false });
+      const session = await auth.api.getSession({ headers: request.headers });
+      return jsonNoStore({ user: session?.user || null, saasEnabled: true });
+    }
+
+    if (url.pathname === "/" && request.method === "GET") {
+      const landingSession = auth ? await auth.api.getSession({ headers: request.headers }) : null;
+      const headers = withCors({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      headers.set("X-Robots-Tag", "index, follow");
+      return new Response(landingPage(saasEnabled, Boolean(landingSession?.user)), { headers });
+    }
+
+    if ((url.pathname === "/app" || url.pathname === "/upload") && request.method === "GET") {
+      return new Response(htmlPage(saasEnabled, googleLoginEnabled), {
+        headers: withCors({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
+      });
+    }
+
+    if (url.pathname === "/account" && request.method === "GET") {
+      if (!saasEnabled) return new Response("Not Found", { status: 404, headers: withCors() });
+      return new Response(accountPage(googleLoginEnabled), {
+        headers: withCors({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
+      });
+    }
+
+    if (url.pathname === "/api-docs" && request.method === "GET") {
+      return new Response(apiDocsPage(url.origin), {
+        headers: withCors({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
+      });
+    }
+
+    if (url.pathname === "/api/webhooks/waffo" && request.method === "POST") {
+      return handleWaffoWebhook(request, env);
+    }
+
+    if (url.pathname.startsWith("/c/") && request.method === "GET") {
+      if (!saasEnabled) return new Response("Not Found", { status: 404, headers: withCors() });
+      const publicId = decodeURIComponent(url.pathname.slice("/c/".length));
+      const mapping = await env.DB.prepare(
+        "SELECT owner_id, slug, public_id FROM saas_clipboards WHERE public_id = ?",
+      ).bind(publicId).first<SaasClipboardMapping>();
+      if (!mapping) return new Response("Not Found", { status: 404, headers: withCors() });
+      return new Response(clipboardDetailPage(mapping.slug, true, mapping.public_id, true), {
+        headers: withCors({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
+      });
     }
 
     await maybeCleanupExpiredEntries(env);
@@ -4059,7 +6023,7 @@ export default {
       h.set("Content-Disposition", "inline");
       h.set("Cache-Control", "no-cache, must-revalidate");
       if (entry.md5) h.set("ETag", `"${entry.md5}"`);
-      if (entry.content_type) h.set("Content-Type", entry.content_type);
+      setSharedFileContentType(h, entry);
       return new Response(obj.body, { headers: h });
     }
 
@@ -4086,7 +6050,7 @@ export default {
       h.set("Content-Disposition", `inline; filename="${entry.filename}"`);
       h.set("Cache-Control", "no-cache, must-revalidate");
       if (entry.md5) h.set("ETag", `"${entry.md5}"`);
-      if (entry.content_type) h.set("Content-Type", entry.content_type);
+      setSharedFileContentType(h, entry);
       return new Response(obj.body, { headers: h });
     }
 
@@ -4199,33 +6163,76 @@ export default {
           }
         }
 
-        const expiration = link.max_file_lifetime_days
-          ? expirationToISO(link.max_file_lifetime_days)
+        let guestEntitlement: AccountEntitlement | null = null;
+        let guestStorageReservationId: string | null = null;
+        if (saasEnabled && link.owner_id && link.owner_id !== ADMIN_OWNER_ID) {
+          guestEntitlement = await getAccountEntitlement(env, link.owner_id);
+          const oversized = candidates.find((item) => item.size > guestEntitlement!.limits.maxFileBytes);
+          if (oversized) {
+            return new Response(
+              guestUploadPage(link, guestText(postLang, "file_too_large", {
+                name: oversized.filename,
+                max: Math.round(guestEntitlement.limits.maxFileBytes / (1024 * 1024)),
+              }), true, postLang),
+              { status: 413, headers: withCors({ "Content-Type": "text/html; charset=utf-8" }) },
+            );
+          }
+          const incoming = candidates.reduce((sum, item) => sum + item.size, 0);
+          guestStorageReservationId = generateID();
+          if (!(await reserveStorageBytes(env, link.owner_id, guestStorageReservationId, incoming, guestEntitlement.limits.storageBytes))) {
+            return new Response(guestUploadPage(link, "Storage quota reached for this PicoShare account.", true, postLang), {
+              status: 413,
+              headers: withCors({ "Content-Type": "text/html; charset=utf-8" }),
+            });
+          }
+        }
+
+        const guestLifetimeDays = guestEntitlement
+          ? Math.min(link.max_file_lifetime_days || guestEntitlement.limits.maxFileLifetimeDays, guestEntitlement.limits.maxFileLifetimeDays)
+          : link.max_file_lifetime_days;
+        const expiration = guestLifetimeDays
+          ? expirationToISO(guestLifetimeDays)
           : null;
 
-        for (const item of candidates) {
-          await env.BUCKET.put(item.id, item.bytes, { httpMetadata: { contentType: item.contentType } });
-          const md5 = md5Hex(item.bytes);
-          await env.DB.prepare(
-            `INSERT INTO entries
-              (id, filename, content_type, size, md5, version, updated_time, expiration_time, note, guest_link_id)
-             VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?, ?)`,
-          )
-            .bind(item.id, item.filename, item.contentType, item.size, md5, expiration, note, guestId)
-            .run();
-          await recordNewFileVersion(
-            env,
-            { id: item.id, filename: item.filename, content_type: item.contentType, size: item.size },
-            1,
-            md5,
-          );
+        const committedIds: string[] = [];
+        let guestUploadSlotsReserved = false;
+        try {
+          if (!(await reserveGuestUploadSlots(env, guestId, candidates.length))) {
+            if (guestStorageReservationId) await releaseStorageReservation(env, guestStorageReservationId, link.owner_id || undefined);
+            return new Response(guestUploadPage(link, guestText(postLang, "upload_limit_reached"), true, postLang), {
+              status: 429,
+              headers: withCors({ "Content-Type": "text/html; charset=utf-8" }),
+            });
+          }
+          guestUploadSlotsReserved = true;
+          for (let index = 0; index < candidates.length; index++) {
+            const item = candidates[index];
+            await env.BUCKET.put(item.id, item.bytes, { httpMetadata: { contentType: item.contentType } });
+            const md5 = md5Hex(item.bytes);
+            await saveNewFileEntry(env, {
+              id: item.id,
+              filename: item.filename,
+              contentType: item.contentType,
+              size: item.size,
+              md5,
+              expiration,
+              note,
+              ownerId: link.owner_id || LOCAL_OWNER_ID,
+            }, guestStorageReservationId ? {
+              id: guestStorageReservationId,
+              consumeBytes: item.size,
+              final: index === candidates.length - 1,
+            } : undefined);
+            committedIds.push(item.id);
+            if (guestEntitlement && link.owner_id) await recordUploadBytes(env, link.owner_id, item.size);
+          }
+        } catch (err) {
+          if (guestStorageReservationId) await releaseStorageReservation(env, guestStorageReservationId, link.owner_id || undefined);
+          if (guestUploadSlotsReserved) await releaseGuestUploadSlots(env, guestId, candidates.length);
+          for (const id of committedIds) await deleteEntryById(env, id).catch(() => undefined);
+          for (const { id } of candidates) await env.BUCKET.delete(id).catch(() => undefined);
+          throw err;
         }
-        await env.DB.prepare(
-          "UPDATE guest_links SET upload_count = COALESCE(upload_count, 0) + ? WHERE id = ?",
-        )
-          .bind(candidates.length, guestId)
-          .run();
-
         const refreshed = await getGuestLinkById(env, guestId);
         const uploadedUrls = candidates
           .slice(0, 3)
@@ -4252,96 +6259,195 @@ export default {
     }
 
     if (url.pathname === "/clipboard-api/list" && request.method === "GET") {
-      const list = await listClipboards(env);
-      return json(list);
+      let ownerId: string | undefined;
+      if (saasEnabled) {
+        const principal = await resolvePrincipal(request, env, auth, true);
+        if (!principal) return unauthorized();
+        ownerId = principal.ownerId;
+        if (principal.userId && principal.authType === "api-key") {
+          const entitlement = await getAccountEntitlement(env, principal.userId);
+          const usage = await recordApiRequest(env, principal.userId, entitlement.limits.monthlyApiRequests, entitlement.limits.apiRequestsPerMinute);
+          if (!usage.allowed) return json({
+            error: usage.reason === "rate" ? "API request rate limit reached" : "monthly API request limit reached",
+            used: usage.used,
+            retryAfterSeconds: usage.reason === "rate" ? 60 : undefined,
+          }, 429);
+        }
+      }
+      return json(await listClipboards(env, ownerId));
     }
 
-    if (url.pathname.startsWith("/clipboard-api/item/")) {
-      const itemBase = "/clipboard-api/item/";
+    if (url.pathname.startsWith("/clipboard-api/item/") || url.pathname.startsWith("/clipboard-api/public/")) {
+      const publicRoute = url.pathname.startsWith("/clipboard-api/public/");
+      if (publicRoute && !saasEnabled) return new Response("Not Found", { status: 404, headers: withCors() });
+      const itemBase = publicRoute ? "/clipboard-api/public/" : "/clipboard-api/item/";
       const passwordSuffix = "/password";
       const isPasswordRoute = url.pathname.endsWith(passwordSuffix);
-      const slugRaw = decodeURIComponent(
+      const keyRaw = decodeURIComponent(
         isPasswordRoute
           ? url.pathname.slice(itemBase.length, -passwordSuffix.length)
           : url.pathname.slice(itemBase.length),
       );
-      const slug = sanitizeClipboardSlug(slugRaw);
-      if (!slug) return json({ error: "invalid clipboard name" }, 400);
-      const existing = await getClipboardRecord(env, slug);
 
+      let ownerId: string | undefined;
+      let canEdit = false;
+      let mapping: SaasClipboardMapping | null = null;
+      let principal: Principal | null = null;
+      let maxClipboardBytes: number | null = null;
+      let maxClipboards: number | null = null;
+      let slug: string | null;
+      if (saasEnabled && publicRoute) {
+        mapping = await env.DB.prepare(
+          "SELECT owner_id, slug, public_id FROM saas_clipboards WHERE public_id = ?",
+        ).bind(keyRaw).first<SaasClipboardMapping>();
+        if (!mapping) return new Response("Not Found", { status: 404, headers: withCors() });
+        ownerId = mapping.owner_id;
+        slug = mapping.slug;
+        principal = await resolvePrincipal(request, env, auth, true);
+        canEdit = Boolean(principal && (principal.isAdmin || principal.ownerId === ownerId));
+        if (request.method !== "GET" && !canEdit) return unauthorized();
+        if (principal?.userId && canEdit) {
+          const entitlement = await getAccountEntitlement(env, principal.userId);
+          maxClipboardBytes = entitlement.limits.maxClipboardBytes;
+          maxClipboards = entitlement.limits.maxClipboards;
+          if (principal.authType === "api-key") {
+            const usage = await recordApiRequest(env, principal.userId, entitlement.limits.monthlyApiRequests, entitlement.limits.apiRequestsPerMinute);
+            if (!usage.allowed) return json({
+              error: usage.reason === "rate" ? "API request rate limit reached" : "monthly API request limit reached",
+              used: usage.used,
+              retryAfterSeconds: usage.reason === "rate" ? 60 : undefined,
+            }, 429);
+          }
+        }
+      } else {
+        slug = sanitizeClipboardSlug(keyRaw);
+        if (!slug) return json({ error: "invalid clipboard name" }, 400);
+        if (saasEnabled) {
+          principal = await resolvePrincipal(request, env, auth, true);
+          if (!principal) return unauthorized();
+          ownerId = principal.ownerId;
+          canEdit = true;
+          if (principal.userId) {
+            const entitlement = await getAccountEntitlement(env, principal.userId);
+            maxClipboardBytes = entitlement.limits.maxClipboardBytes;
+            maxClipboards = entitlement.limits.maxClipboards;
+            if (principal.authType === "api-key") {
+              const usage = await recordApiRequest(env, principal.userId, entitlement.limits.monthlyApiRequests, entitlement.limits.apiRequestsPerMinute);
+              if (!usage.allowed) return json({
+                error: usage.reason === "rate" ? "API request rate limit reached" : "monthly API request limit reached",
+                used: usage.used,
+                retryAfterSeconds: usage.reason === "rate" ? 60 : undefined,
+              }, 429);
+            }
+          }
+        }
+        if (ownerId) mapping = await getSaasClipboardMapping(env, ownerId, slug);
+      }
+
+      const existing = await getClipboardRecord(env, slug, ownerId);
       if (isPasswordRoute) {
         if (request.method !== "PUT") {
           return new Response("Method Not Allowed", { status: 405, headers: withCors() });
         }
-        const body = (await request.json()) as {
-          password?: unknown;
-          newPassword?: unknown;
-        };
+        const body = (await request.json()) as { password?: unknown; newPassword?: unknown };
         const newPassword = normalizeClipboardPassword(body.newPassword);
         const oldPassword = normalizeClipboardPassword(body.password);
-        if (existing?.passwordHash) {
+        if (existing?.passwordHash && !canEdit) {
           if (!oldPassword) return json({ error: "password required" }, 401);
           if (!(await verifyClipboardPassword(existing.passwordHash, oldPassword))) {
             return json({ error: "invalid password" }, 401);
           }
         }
+        if (saasEnabled && ownerId && slug) {
+          mapping = await ensureSaasClipboardMapping(env, ownerId, slug, maxClipboards);
+          if (!mapping) return json({ error: "clipboard limit reached", limit: maxClipboards }, 403);
+        }
         const now = new Date().toISOString();
         const next: ClipboardRecord = {
           slug,
+          publicId: mapping?.public_id || existing?.publicId,
           content: existing?.content || "",
           createdAt: existing?.createdAt || now,
           updatedAt: now,
           passwordHash: newPassword ? await sha256Hex(newPassword) : null,
         };
-        await env.CLIPBOARD.put(clipboardKey(slug), JSON.stringify(next));
-        return json({ ok: true, hasPassword: Boolean(next.passwordHash), updatedAt: now });
+        await env.CLIPBOARD.put(clipboardKey(slug, ownerId), JSON.stringify(next));
+        return json({
+          ok: true,
+          hasPassword: Boolean(next.passwordHash),
+          publicId: next.publicId,
+          updatedAt: now,
+          maxContentBytes: canEdit ? maxClipboardBytes : null,
+        });
       }
 
       if (request.method === "GET") {
         if (!existing) {
+          if (publicRoute) return new Response("Not Found", { status: 404, headers: withCors() });
           return json({
             slug,
             content: "",
             createdAt: null,
             updatedAt: null,
             hasPassword: false,
+            canEdit,
+            maxContentBytes: canEdit ? maxClipboardBytes : null,
             ...calculateClipboardStats(""),
           });
         }
-        const auth = await authorizeClipboardRequest(request, existing);
-        if (!auth.ok) return json({ error: "password required", hasPassword: true }, 401);
-        return json({
+        const authorized = canEdit ? { ok: true, normalized: null } : await authorizeClipboardRequest(request, existing);
+        if (!authorized.ok) return json({ error: "password required", hasPassword: true }, 401);
+        return jsonNoStore({
           slug: existing.slug,
+          publicId: mapping?.public_id || existing.publicId,
+          canEdit,
           content: existing.content,
           createdAt: existing.createdAt,
           updatedAt: existing.updatedAt,
           hasPassword: Boolean(existing.passwordHash),
+          maxContentBytes: canEdit ? maxClipboardBytes : null,
           ...calculateClipboardStats(existing.content),
         });
+      }
+
+      if (request.method === "DELETE") {
+        if (!saasEnabled || !canEdit || !ownerId || !slug || !mapping) return unauthorized();
+        await env.CLIPBOARD.delete(clipboardKey(slug, ownerId));
+        await env.DB.prepare("DELETE FROM saas_clipboards WHERE owner_id = ? AND slug = ?")
+          .bind(ownerId, slug).run();
+        return json({ ok: true });
       }
 
       if (request.method === "PUT") {
         const body = (await request.json()) as { content?: unknown };
         const content = typeof body.content === "string" ? body.content : "";
-        if (content.length > MAX_CLIPBOARD_CHARS) {
-          return json({ error: `content too large, max ${MAX_CLIPBOARD_CHARS} chars` }, 400);
+        const contentBytes = new TextEncoder().encode(content).byteLength;
+        if (content.length > MAX_CLIPBOARD_CHARS || (maxClipboardBytes !== null && contentBytes > maxClipboardBytes)) {
+          return json({ error: "clipboard text exceeds this plan's limit", maxBytes: maxClipboardBytes ?? null }, 413);
         }
-        const auth = await authorizeClipboardRequest(request, existing);
-        if (!auth.ok) return json({ error: "password required", hasPassword: true }, 401);
+        const authorized = canEdit ? { ok: true, normalized: null } : await authorizeClipboardRequest(request, existing);
+        if (!authorized.ok) return json({ error: "password required", hasPassword: true }, 401);
+        if (saasEnabled && ownerId && slug) {
+          mapping = await ensureSaasClipboardMapping(env, ownerId, slug, maxClipboards);
+          if (!mapping) return json({ error: "clipboard limit reached", limit: maxClipboards }, 403);
+        }
         const now = new Date().toISOString();
         const next: ClipboardRecord = {
           slug,
+          publicId: mapping?.public_id || existing?.publicId,
           content,
           createdAt: existing?.createdAt || now,
           updatedAt: now,
           passwordHash: existing?.passwordHash || null,
         };
-        await env.CLIPBOARD.put(clipboardKey(slug), JSON.stringify(next));
+        await env.CLIPBOARD.put(clipboardKey(slug, ownerId), JSON.stringify(next));
         return json({
           ok: true,
           slug,
+          publicId: next.publicId,
           updatedAt: now,
           hasPassword: Boolean(next.passwordHash),
+          maxContentBytes: canEdit ? maxClipboardBytes : null,
           ...calculateClipboardStats(content),
         });
       }
@@ -4350,14 +6456,560 @@ export default {
     }
 
     if (url.pathname === "/clips" && request.method === "GET") {
-      return new Response(clipboardListPage(), {
-        headers: withCors({ "Content-Type": "text/html; charset=utf-8" }),
+      if (saasEnabled && !(await resolvePrincipal(request, env, auth, true))) {
+        return Response.redirect(new URL("/account", url).toString(), 302);
+      }
+      return new Response(clipboardListPage(saasEnabled), {
+        headers: withCors({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
       });
     }
 
     if (url.pathname.startsWith("/api/")) {
-      if (!(await requireAuth(request, env))) {
-        return unauthorized();
+      const principal = await resolvePrincipal(request, env, auth, saasEnabled);
+      if (!principal) return unauthorized();
+      const ownerId = principal.ownerId;
+      const ownerFilter = saasEnabled && !principal.isAdmin ? ownerId : undefined;
+      let entitlement: AccountEntitlement | null = null;
+      if (saasEnabled && principal.userId) {
+        entitlement = await getAccountEntitlement(env, principal.userId);
+        if (principal.authType === "api-key") {
+          const usage = await recordApiRequest(env, principal.userId, entitlement.limits.monthlyApiRequests, entitlement.limits.apiRequestsPerMinute);
+          if (!usage.allowed) {
+            return json({
+              error: usage.reason === "rate" ? "API request rate limit reached" : "monthly API request limit reached",
+              used: usage.used,
+              retryAfterSeconds: usage.reason === "rate" ? 60 : undefined,
+            }, 429);
+          }
+        }
+      }
+
+      if (url.pathname === "/api/admin/pro-grant") {
+        const superadmin = await resolveSaasSuperadmin(request, env, auth, principal);
+        if (!superadmin) return json({ error: "Superadmin access is required" }, 403);
+
+        if (request.method === "GET") {
+          const targetEmail = url.searchParams.get("email")?.trim().toLowerCase() || "";
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetEmail) || targetEmail.length > 254) {
+            return json({ error: "A valid account email is required" }, 400);
+          }
+          const target = await env.DB.prepare(
+            'SELECT id, name, email FROM "user" WHERE lower(email) = ? LIMIT 1',
+          ).bind(targetEmail).first<{ id: string; name: string | null; email: string }>();
+          if (!target) return json({ error: "Account not found" }, 404);
+          await ensureSaasAccount(env, target.id, target.email);
+          const entitlement = await getAccountEntitlement(env, target.id);
+          const manualGrant = await getManualProGrant(env, target.id);
+          const audit = await env.DB.prepare(
+            `SELECT action, actor_email, expires_at, note, created_at
+             FROM admin_pro_grant_audit WHERE user_id = ?
+             ORDER BY created_at DESC LIMIT 10`,
+          ).bind(target.id).all<{
+            action: string;
+            actor_email: string;
+            expires_at: string | null;
+            note: string | null;
+            created_at: string;
+          }>();
+          return jsonNoStore({
+            user: { id: target.id, name: target.name, email: target.email },
+            plan: entitlement.plan,
+            status: entitlement.status,
+            source: entitlement.source,
+            currentPeriodEnd: entitlement.currentPeriodEnd,
+            manualGrant,
+            audit: audit.results || [],
+          });
+        }
+
+        if (request.method !== "POST" && request.method !== "DELETE") {
+          return new Response("Method Not Allowed", { status: 405, headers: withCors() });
+        }
+        if (!isAllowedRequestOrigin(request.headers.get("Origin"), env.BETTER_AUTH_URL, request.url)) {
+          return json({ error: "Request origin is not allowed" }, 403);
+        }
+
+        let body: { email?: unknown; durationDays?: unknown; note?: unknown };
+        try {
+          body = await request.json() as { email?: unknown; durationDays?: unknown; note?: unknown };
+        } catch {
+          return json({ error: "A JSON request body is required" }, 400);
+        }
+        const targetEmail = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetEmail) || targetEmail.length > 254) {
+          return json({ error: "A valid account email is required" }, 400);
+        }
+        const target = await env.DB.prepare(
+          'SELECT id, name, email FROM "user" WHERE lower(email) = ? LIMIT 1',
+        ).bind(targetEmail).first<{ id: string; name: string | null; email: string }>();
+        if (!target) return json({ error: "Account not found" }, 404);
+        await ensureSaasAccount(env, target.id, target.email);
+
+        if (request.method === "POST") {
+          let expiresAt: string | null = null;
+          if (body.durationDays !== undefined && body.durationDays !== null && body.durationDays !== "permanent") {
+            if (typeof body.durationDays !== "number" || ![30, 90, 365].includes(body.durationDays)) {
+              return json({ error: "Duration must be permanent, 30, 90, or 365 days" }, 400);
+            }
+            expiresAt = new Date(Date.now() + body.durationDays * 24 * 60 * 60 * 1000).toISOString();
+          }
+          if (body.note !== undefined && typeof body.note !== "string") {
+            return json({ error: "Note must be text" }, 400);
+          }
+          const note = typeof body.note === "string" ? body.note.trim().slice(0, 200) || null : null;
+          const auditId = await grantManualPro(env, {
+            userId: target.id,
+            targetEmail: target.email,
+            actorUserId: superadmin.userId,
+            actorEmail: superadmin.email,
+            expiresAt,
+            note,
+          });
+          return jsonNoStore({ ok: true, auditId, expiresAt });
+        }
+
+        const auditId = await revokeManualPro(env, {
+          userId: target.id,
+          targetEmail: target.email,
+          actorUserId: superadmin.userId,
+          actorEmail: superadmin.email,
+        });
+        if (!auditId) return json({ error: "No manual Pro grant is active for this account" }, 404);
+        return jsonNoStore({ ok: true, auditId });
+      }
+
+      if (url.pathname === "/api/admin/users" || url.pathname.startsWith("/api/admin/users/")) {
+        const superadmin = await resolveSaasSuperadmin(request, env, auth, principal);
+        if (!superadmin) return json({ error: "Superadmin access is required" }, 403);
+
+        if (url.pathname === "/api/admin/users" && request.method === "GET") {
+          const search = (url.searchParams.get("search") || "").trim().slice(0, 100);
+          const limit = Math.max(1, Math.min(50, Number.parseInt(url.searchParams.get("limit") || "20", 10) || 20));
+          const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(url.searchParams.get("offset") || "0", 10) || 0));
+          const protectedEmails = (env.SAAS_SUPERADMIN_EMAILS || "")
+            .split(",").map((email) => email.trim().toLowerCase()).filter(Boolean);
+          const protectedFilter = protectedEmails.length
+            ? `AND lower(u.email) NOT IN (${protectedEmails.map(() => "?").join(",")})`
+            : "";
+          const where = `(? = '' OR instr(lower(u.email), lower(?)) > 0 OR instr(lower(COALESCE(u.name, '')), lower(?)) > 0) ${protectedFilter}`;
+          const params = [search, search, search, ...protectedEmails];
+          const totalRow = await env.DB.prepare(
+            `SELECT COUNT(*) AS total FROM "user" u WHERE ${where}`,
+          ).bind(...params).first<{ total: number }>();
+          const result = await env.DB.prepare(
+            `SELECT u.id, u.email, u.name, u.createdAt AS createdAt,
+                    CASE WHEN g.status = 'active'
+                              AND (g.expires_at IS NULL OR datetime(g.expires_at) > CURRENT_TIMESTAMP)
+                         THEN 'pro' ELSE COALESCE(b.plan_code, 'free') END AS plan,
+                    CASE WHEN g.status = 'active'
+                              AND (g.expires_at IS NULL OR datetime(g.expires_at) > CURRENT_TIMESTAMP)
+                         THEN 'admin_granted' ELSE COALESCE(b.status, 'free') END AS status,
+                    COALESCE(SUM(e.size), 0) AS storageBytes,
+                    COUNT(DISTINCT e.id) AS fileCount
+             FROM "user" u
+             LEFT JOIN billing_accounts b ON b.user_id = u.id
+             LEFT JOIN admin_pro_grants g ON g.user_id = u.id
+             LEFT JOIN entries e ON e.owner_id = u.id
+             WHERE ${where}
+             GROUP BY u.id
+             ORDER BY u.createdAt DESC, u.id ASC
+             LIMIT ? OFFSET ?`,
+          ).bind(...params, limit, offset).all<{
+            id: string;
+            email: string;
+            name: string | null;
+            createdAt: string;
+            plan: string;
+            status: string;
+            storageBytes: number;
+            fileCount: number;
+          }>();
+          return jsonNoStore({
+            users: result.results || [], total: Number(totalRow?.total || 0), limit, offset,
+          });
+        }
+
+        const userRoute = /^\/api\/admin\/users\/([^/]+)(?:\/files(?:\/([^/]+))?)?$/.exec(url.pathname);
+        if (!userRoute) return json({ error: "Unknown admin user route" }, 404);
+        let targetId = "";
+        let fileId: string | null = null;
+        try {
+          targetId = decodeURIComponent(userRoute[1]);
+          fileId = userRoute[2] ? decodeURIComponent(userRoute[2]) : null;
+        } catch {
+          return json({ error: "Invalid user or file id" }, 400);
+        }
+        if (!targetId || targetId.length > 200 || (fileId && fileId.length > 200)) {
+          return json({ error: "Invalid user or file id" }, 400);
+        }
+
+        if (url.pathname.endsWith("/files") && !fileId && request.method === "GET") {
+          const target = await env.DB.prepare(
+            'SELECT id, name, email FROM "user" WHERE id = ? LIMIT 1',
+          ).bind(targetId).first<AdminTargetUser>();
+          if (!target || isProtectedAdminEmail(env, target.email)) return json({ error: "Account not found" }, 404);
+          const limit = Math.max(1, Math.min(50, Number.parseInt(url.searchParams.get("limit") || "20", 10) || 20));
+          const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(url.searchParams.get("offset") || "0", 10) || 0));
+          const totalRow = await env.DB.prepare(
+            "SELECT COUNT(*) AS total FROM entries WHERE owner_id = ?",
+          ).bind(targetId).first<{ total: number }>();
+          const result = await env.DB.prepare(
+            `SELECT e.id, e.filename, e.size, e.upload_time AS uploadTime,
+                    e.expiration_time AS expirationTime, e.note,
+                    (SELECT COUNT(*) FROM download_events d WHERE d.entry_id = e.id) AS downloadCount
+             FROM entries e WHERE e.owner_id = ?
+             ORDER BY e.upload_time DESC, e.id ASC LIMIT ? OFFSET ?`,
+          ).bind(targetId, limit, offset).all<{
+            id: string;
+            filename: string;
+            size: number;
+            uploadTime: string;
+            expirationTime: string | null;
+            note: string | null;
+            downloadCount: number;
+          }>();
+          return jsonNoStore({
+            user: { id: target.id, email: target.email, name: target.name },
+            files: result.results || [], total: Number(totalRow?.total || 0), limit, offset,
+          });
+        }
+
+        if (fileId && url.pathname.includes("/files/") && request.method === "DELETE") {
+          if (request.headers.get("Origin") !== url.origin) return json({ error: "Request origin is not allowed" }, 403);
+          const target = await env.DB.prepare(
+            'SELECT id, name, email FROM "user" WHERE id = ? LIMIT 1',
+          ).bind(targetId).first<AdminTargetUser>();
+          if (!target || isProtectedAdminEmail(env, target.email)) return json({ error: "Account not found" }, 404);
+          const entry = await getEntryById(env, fileId, targetId);
+          if (!entry) return json({ error: "File not found" }, 404);
+          await deleteEntryById(env, entry.id);
+          await recordAdminAction(env, superadmin, target, "delete_file", {
+            fileId: entry.id, filename: entry.filename, size: entry.size,
+          });
+          return jsonNoStore({ ok: true });
+        }
+
+        if (!fileId && !url.pathname.endsWith("/files") && request.method === "DELETE") {
+          if (request.headers.get("Origin") !== url.origin) return json({ error: "Request origin is not allowed" }, 403);
+          let body: { confirmEmail?: unknown };
+          try {
+            body = await request.json() as { confirmEmail?: unknown };
+          } catch {
+            return json({ error: "A JSON request body is required" }, 400);
+          }
+          const target = await env.DB.prepare(
+            'SELECT id, name, email FROM "user" WHERE id = ? LIMIT 1',
+          ).bind(targetId).first<AdminTargetUser>();
+          if (!target) {
+            const deleted = await env.DB.prepare(
+              "SELECT email FROM deleted_saas_users WHERE user_id = ? LIMIT 1",
+            ).bind(targetId).first<{ email: string }>();
+            if (deleted && typeof body.confirmEmail === "string" && body.confirmEmail.trim().toLowerCase() === deleted.email.toLowerCase()) {
+              return jsonNoStore({ ok: true, alreadyDeleted: true });
+            }
+            return json({ error: "Account not found" }, 404);
+          }
+          if (isProtectedAdminEmail(env, target.email)) return json({ error: "Protected superadmin accounts cannot be deleted" }, 403);
+          if (target.id === superadmin.userId) return json({ error: "You cannot delete your own account" }, 400);
+          if (typeof body.confirmEmail !== "string" || body.confirmEmail.trim().toLowerCase() !== target.email.toLowerCase()) {
+            return json({ error: "The confirmation email does not match this account" }, 400);
+          }
+          const billing = await env.DB.prepare(
+            "SELECT provider, status FROM billing_accounts WHERE user_id = ? LIMIT 1",
+          ).bind(target.id).first<{ provider: string | null; status: string }>();
+          if (["waffo", "opcpay"].includes(billing?.provider || "") && ["active", "canceling", "past_due", "pending"].includes(billing?.status.toLowerCase() || "")) {
+            return json({ error: "subscription_active" }, 409);
+          }
+          try {
+            const complete = await deleteSaasUserData(env, superadmin, target);
+            if (!complete) return jsonNoStore({ ok: true, pending: true });
+          } catch (error) {
+            console.error("Superadmin account deletion did not finish", target.id, error);
+            return json({ error: "account_cleanup_pending" }, 500);
+          }
+          return jsonNoStore({ ok: true });
+        }
+
+        return new Response("Method Not Allowed", { status: 405, headers: withCors() });
+      }
+
+      if (url.pathname === "/api/account" && request.method === "GET") {
+        if (!auth || principal.authType !== "session" || !principal.userId) return unauthorized();
+        const session = await auth.api.getSession({ headers: request.headers });
+        if (!session) return unauthorized();
+        const userEntitlement = entitlement || await getAccountEntitlement(env, principal.userId);
+        const billingAccount = await env.DB.prepare(
+          "SELECT provider FROM billing_accounts WHERE user_id = ?",
+        ).bind(principal.userId).first<{ provider: string | null }>();
+        return json({
+          user: session.user,
+          isSuperadmin: Boolean(session.user.emailVerified && isSaasSuperadmin(session.user.email, env.SAAS_SUPERADMIN_EMAILS)),
+          plan: userEntitlement.plan,
+          status: userEntitlement.status,
+          currentPeriodEnd: userEntitlement.currentPeriodEnd,
+          limits: userEntitlement.limits,
+          storageUsed: await getOwnerStorageBytes(env, principal.userId),
+          apiRequestsUsed: await getMonthlyApiRequests(env, principal.userId),
+          checkout: {
+            monthly: Boolean(env.WAFFO_PRODUCT_PRO_MONTHLY && env.WAFFO_MERCHANT_ID && env.WAFFO_PRIVATE_KEY),
+            yearly: Boolean(env.WAFFO_PRODUCT_PRO_YEARLY && env.WAFFO_MERCHANT_ID && env.WAFFO_PRIVATE_KEY),
+          },
+          opcpayAvailable: Boolean(env.OPCPAY_API_KEY),
+          portalAvailable: Boolean(userEntitlement.plan === "pro" && billingAccount?.provider === "waffo" && env.WAFFO_STORE_ID && env.WAFFO_MERCHANT_ID && env.WAFFO_PRIVATE_KEY),
+        });
+      }
+
+      if (url.pathname === "/api/billing/checkout-status" && request.method === "GET") {
+        if (!auth || principal.authType !== "session" || !principal.userId) return unauthorized();
+        const reference = url.searchParams.get("reference")?.trim() || "";
+        if (!reference || reference.length > 128) return json({ error: "A valid checkout reference is required" }, 400);
+        const attempt = await env.DB.prepare(
+          "SELECT status, plan_code, product_id, session_id FROM billing_checkout_attempts WHERE reference = ? AND user_id = ?",
+        ).bind(reference, principal.userId).first<{ status: string; plan_code: string; product_id: string; session_id: string | null }>();
+        if (!attempt) return json({ error: "Checkout reference not found" }, 404);
+        let checkoutStatus = attempt.status;
+        if (attempt.status !== "paid" && reference.startsWith("ps-opc-") && env.OPCPAY_API_KEY) {
+          try {
+            const access = await getOpcPayAccess(env, principal.userId);
+              if (access.access_granted === true && access.decision === "ALLOW" && access.valid_until) {
+                const validUntil = Date.parse(access.valid_until);
+                if (Number.isFinite(validUntil) && validUntil > Date.now()) {
+                  const validFrom = typeof access.valid_from === "string" && Number.isFinite(Date.parse(access.valid_from))
+                    ? new Date(Date.parse(access.valid_from)).toISOString()
+                    : new Date().toISOString();
+                  const end = new Date(validUntil).toISOString();
+                  await env.DB.batch([
+                    env.DB.prepare("UPDATE billing_checkout_attempts SET status = 'paid' WHERE reference = ? AND user_id = ?")
+                      .bind(reference, principal.userId),
+                    env.DB.prepare(
+                      `UPDATE billing_accounts SET plan_code = 'pro', status = 'active', provider = 'opcpay',
+                         provider_order_id = COALESCE(?, provider_order_id), provider_product_id = ?,
+                         current_period_start = ?, current_period_end = ?, grace_until = NULL,
+                         updated_at = CURRENT_TIMESTAMP WHERE user_id = ?`,
+                    ).bind(attempt.session_id, attempt.product_id, validFrom, end, principal.userId),
+                  ]);
+                  checkoutStatus = "paid";
+                }
+              }
+          } catch (error) {
+            console.error("OPCPay entitlement check failed", { reference, detail: (error as Error)?.message || String(error) });
+          }
+        }
+        if (attempt.status === "paid" && attempt.plan_code === "pro") {
+          // Recover checkouts acknowledged by older builds where
+          // subscription.payment_succeeded marked the attempt paid but did not
+          // grant the matching Pro entitlement.
+          const latestEvent = await env.DB.prepare(
+            `SELECT event_type, received_at FROM billing_webhook_events
+             WHERE reference = ? AND processing_status = 'processed'
+             ORDER BY received_at DESC, rowid DESC LIMIT 1`,
+          ).bind(reference).first<{ event_type: string; received_at: string }>();
+          if (latestEvent?.event_type === "subscription.payment_succeeded") {
+            const periodEnd = attempt.product_id.startsWith("PROD_")
+              ? checkoutPeriodEnd(attempt.product_id, env, latestEvent.received_at)
+              : null;
+            if (periodEnd) {
+              await env.DB.prepare(
+                `UPDATE billing_accounts
+                 SET plan_code = 'pro', status = 'active', provider = 'waffo',
+                     provider_product_id = ?, current_period_start = ?, current_period_end = ?,
+                     grace_until = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE user_id = ?`,
+              ).bind(attempt.product_id, latestEvent.received_at, periodEnd, principal.userId).run();
+            }
+          }
+        }
+        return jsonNoStore({ status: checkoutStatus });
+      }
+
+      if (url.pathname === "/api/api-keys" && request.method === "GET") {
+        if (!auth || principal.authType !== "session") return unauthorized();
+        const result = await auth.api.listApiKeys({ headers: request.headers });
+        const apiKeys = Array.isArray(result) ? result : ((result as { apiKeys?: unknown[] }).apiKeys || []);
+        return jsonNoStore({ apiKeys });
+      }
+
+      if (url.pathname === "/api/api-keys" && request.method === "POST") {
+        if (!auth || principal.authType !== "session" || !principal.userId) return unauthorized();
+        const body = (await request.json()) as { name?: unknown; expiresIn?: unknown };
+        const name = typeof body.name === "string" ? body.name.trim().slice(0, 32) : "";
+        if (!name) return json({ error: "API Key name is required" }, 400);
+        const expiresInValue = body.expiresIn === undefined ? null : body.expiresIn;
+        if (expiresInValue !== null && (typeof expiresInValue !== "number" || !API_KEY_EXPIRATION_SECONDS.has(expiresInValue))) {
+          return json({ error: "Invalid API Key expiration" }, 400);
+        }
+        const expiresIn = typeof expiresInValue === "number" ? expiresInValue : null;
+        const lockToken = crypto.randomUUID();
+        const lock = await env.DB.prepare(
+          `INSERT INTO saas_api_key_creation_locks(user_id, lock_token, expires_at)
+           VALUES (?, ?, datetime('now', '+30 seconds'))
+           ON CONFLICT(user_id) DO UPDATE SET lock_token = excluded.lock_token, expires_at = excluded.expires_at
+           WHERE saas_api_key_creation_locks.expires_at <= CURRENT_TIMESTAMP`,
+        ).bind(principal.userId, lockToken).run();
+        if (Number(lock.meta.changes || 0) !== 1) {
+          return json({ error: "Another API Key is being created for this account; retry shortly" }, 409);
+        }
+        try {
+          const current = await auth.api.listApiKeys({ headers: request.headers });
+          const apiKeys = Array.isArray(current) ? current : ((current as { apiKeys?: unknown[] }).apiKeys || []);
+          const userEntitlement = entitlement || await getAccountEntitlement(env, principal.userId);
+          if (apiKeys.length >= userEntitlement.limits.maxApiKeys) {
+            return json({ error: "API Key limit reached for this plan" }, 403);
+          }
+          const created = await auth.api.createApiKey({ body: { name, expiresIn }, headers: request.headers });
+          return jsonNoStore({ key: created.key, id: created.id, name: created.name, start: created.start, expiresAt: created.expiresAt }, 201);
+        } finally {
+          await env.DB.prepare("DELETE FROM saas_api_key_creation_locks WHERE user_id = ? AND lock_token = ?")
+            .bind(principal.userId, lockToken).run();
+        }
+      }
+
+      if (url.pathname.startsWith("/api/api-keys/") && request.method === "DELETE") {
+        if (!auth || principal.authType !== "session") return unauthorized();
+        const keyId = decodeURIComponent(url.pathname.slice("/api/api-keys/".length));
+        if (!keyId) return json({ error: "API Key id is required" }, 400);
+        await auth.api.deleteApiKey({ body: { keyId }, headers: request.headers });
+        return json({ ok: true });
+      }
+
+      if (url.pathname === "/api/billing/opcpay/product" && request.method === "GET") {
+        if (!auth || principal.authType !== "session" || !principal.userId) return unauthorized();
+        if (!env.OPCPAY_API_KEY) return json({ error: "OPCPay checkout is not configured" }, 503);
+        try {
+          const product = await getOpcPayProduct(env);
+          return jsonNoStore({
+            capabilityStatus: product.capability_status || "UNKNOWN",
+            billingMode: product.billing_mode || null,
+            options: (product.charging_options || []).filter((option) => option.billing_mode === "ONE_TIME_DURATION").map((option) => ({
+              skuId: option.sku_id,
+              displayName: option.display_name,
+              price: option.price,
+              currency: option.currency,
+              durationPeriod: option.duration_period || null,
+            })),
+          });
+        } catch (error) {
+          console.error("OPCPay product lookup failed", (error as Error)?.message || String(error));
+          return json({ error: "Could not load available Pro plans" }, 502);
+        }
+      }
+
+      if (url.pathname === "/api/billing/opcpay/checkout" && request.method === "POST") {
+        if (!auth || principal.authType !== "session" || !principal.userId) return unauthorized();
+        if (!env.OPCPAY_API_KEY) return json({ error: "OPCPay checkout is not configured" }, 503);
+        const body = (await request.json()) as { skuId?: unknown; language?: unknown };
+        if (body.language !== "zh") return json({ error: "OPCPay is only available in the Chinese interface" }, 403);
+        const skuId = typeof body.skuId === "string" ? body.skuId.trim() : "";
+        if (!skuId || skuId.length > 128) return json({ error: "A valid plan is required" }, 400);
+        try {
+          const product = await getOpcPayProduct(env);
+          if (product.capability_status !== "ENABLED") return json({ error: "OPCPay purchasing is not enabled" }, 503);
+          const option = (product.charging_options || []).find((item) => item.sku_id === skuId && item.billing_mode === "ONE_TIME_DURATION" && item.entitlement_rule === "FIXED_DURATION");
+          if (!option || !option.duration_period) return json({ error: "The selected duration plan is unavailable" }, 400);
+          const reference = `ps-opc-${Date.now()}-${generateID()}`;
+          const callbackUrl = new URL("/account", env.BETTER_AUTH_URL || url.origin);
+          callbackUrl.searchParams.set("checkout", "opcpay");
+          callbackUrl.searchParams.set("reference", reference);
+          await env.DB.prepare(
+            `INSERT INTO billing_checkout_attempts(reference, user_id, plan_code, product_id)
+             VALUES (?, ?, 'pro', ?)`
+          ).bind(reference, principal.userId, skuId).run();
+          const purchase = await createOpcPayPurchase(env, {
+            userId: principal.userId,
+            idempotencyKey: reference,
+            skuId,
+            callbackUrl: callbackUrl.toString(),
+          });
+          if (purchase.status !== "READY" || !purchase.purchase_url) {
+            await env.DB.prepare("UPDATE billing_checkout_attempts SET status = ? WHERE reference = ?")
+              .bind(purchase.status === "FAILED" ? "failed" : "pending", reference).run();
+            return jsonNoStore({ status: purchase.status || "UNKNOWN", checkoutUrl: null });
+          }
+          const purchaseUrl = typeof purchase.purchase_url === "string" ? purchase.purchase_url : "";
+          const qrCode = typeof purchase.purchase_qr_code === "string" ? purchase.purchase_qr_code : "";
+          let parsedPurchaseUrl: URL;
+          try {
+            parsedPurchaseUrl = new URL(purchaseUrl);
+          } catch {
+            await env.DB.prepare("UPDATE billing_checkout_attempts SET status = 'failed' WHERE reference = ?").bind(reference).run();
+            return json({ error: "The payment provider returned an invalid purchase URL" }, 502);
+          }
+          if (!["https:", "alipays:"].includes(parsedPurchaseUrl.protocol) || parsedPurchaseUrl.username || parsedPurchaseUrl.password) {
+            await env.DB.prepare("UPDATE billing_checkout_attempts SET status = 'failed' WHERE reference = ?").bind(reference).run();
+            return json({ error: "The payment provider returned an unsupported purchase URL" }, 502);
+          }
+          if (qrCode) {
+            try {
+              const parsedQrCode = new URL(qrCode);
+              if (parsedQrCode.protocol !== "https:" || parsedQrCode.hostname !== "mobilecodec.alipay.com" || parsedQrCode.username || parsedQrCode.password) throw new Error("invalid QR URL");
+            } catch {
+              return json({ error: "The payment provider returned an invalid QR code URL" }, 502);
+            }
+          }
+          return jsonNoStore({ checkoutUrl: purchaseUrl, qrCode: qrCode || null, reference });
+        } catch (error) {
+          console.error("OPCPay purchase creation failed", (error as Error)?.message || String(error));
+          return json({ error: "Could not create an Alipay purchase entry" }, 502);
+        }
+      }
+
+      if (url.pathname === "/api/billing/checkout" && request.method === "POST") {
+        if (!auth || principal.authType !== "session" || !principal.userId) return unauthorized();
+        const body = (await request.json()) as { period?: unknown; provider?: unknown; skuId?: unknown };
+        if (body.provider === "opcpay") {
+          return json({ error: "Use the language-specific OPCPay checkout endpoint" }, 400);
+        }
+        const period = body.period === "yearly" ? "yearly" : body.period === "monthly" ? "monthly" : null;
+        if (!period) return json({ error: "period must be monthly or yearly" }, 400);
+        const productId = period === "yearly" ? env.WAFFO_PRODUCT_PRO_YEARLY : env.WAFFO_PRODUCT_PRO_MONTHLY;
+        if (!productId || !env.WAFFO_MERCHANT_ID || !env.WAFFO_PRIVATE_KEY) {
+          return json({ error: "Waffo checkout is not configured for this plan" }, 503);
+        }
+        const reference = `ps-${Date.now()}-${generateID()}`;
+        const successUrl = new URL("/account", env.BETTER_AUTH_URL || url.origin);
+        successUrl.searchParams.set("checkout", "success");
+        successUrl.searchParams.set("reference", reference);
+        await env.DB.prepare(
+          `INSERT INTO billing_checkout_attempts(reference, user_id, plan_code, product_id)
+           VALUES (?, ?, 'pro', ?)`,
+        ).bind(reference, principal.userId, productId).run();
+        try {
+          const checkout = await createWaffoSubscriptionCheckout(env, {
+            productId,
+            buyerIdentity: principal.userId,
+            buyerEmail: principal.email || undefined,
+            orderReference: reference,
+            currency: env.WAFFO_CURRENCY || "USD",
+            successUrl: successUrl.toString(),
+            cancelUrl: new URL("/account?checkout=cancelled", env.BETTER_AUTH_URL || url.origin).toString(),
+            metadata: { userId: principal.userId, plan: "pro", period },
+            idempotencyKey: reference,
+          });
+          await env.DB.prepare(
+            "UPDATE billing_checkout_attempts SET session_id = ? WHERE reference = ?",
+          ).bind(checkout.sessionId, reference).run();
+          return jsonNoStore({ checkoutUrl: checkout.checkoutUrl });
+        } catch (err) {
+          await env.DB.prepare(
+            "UPDATE billing_checkout_attempts SET status = 'failed' WHERE reference = ?",
+          ).bind(reference).run();
+          const detail = String((err as Error)?.message || err);
+          console.error("Waffo checkout session creation failed", { reference, period, detail });
+          return json({ error: `Could not create checkout: ${detail}` }, 502);
+        }
+      }
+
+      if (url.pathname === "/api/billing/portal" && request.method === "POST") {
+        if (!auth || principal.authType !== "session" || !principal.userId) return unauthorized();
+        if (!env.WAFFO_STORE_ID || !env.WAFFO_MERCHANT_ID || !env.WAFFO_PRIVATE_KEY) {
+          return json({ error: "Waffo customer portal is not configured" }, 503);
+        }
+        try {
+          const portal = await createWaffoCustomerPortalLink(env, { buyerIdentity: principal.userId });
+          return jsonNoStore({ portalUrl: portal.portalUrl });
+        } catch (err) {
+          return json({ error: `Could not create billing portal link: ${String((err as Error)?.message || err)}` }, 502);
+        }
       }
 
       if (url.pathname === "/api/entry/multipart/init" && request.method === "POST") {
@@ -4380,20 +7032,26 @@ export default {
         if (!Number.isFinite(size) || size < 0) {
           return json({ error: "invalid file size" }, 400);
         }
+        if (entitlement && size > entitlement.limits.maxFileBytes) {
+          return json({ error: "file exceeds this plan's per-file limit", maxFileBytes: entitlement.limits.maxFileBytes }, 413);
+        }
         if (!shouldUseMultipartUpload(size)) {
           return json({ error: "file smaller than 100MB should use regular upload" }, 400);
         }
         const note = typeof body.note === "string" ? body.note.trim().slice(0, 1000) || null : null;
-        const expirationInput = body.expirationDays == null ? null : String(body.expirationDays);
-        const expiration = expirationToISO(parseExpirationDays(expirationInput));
+        const maxFileLifetimeDays = entitlement?.limits.maxFileLifetimeDays ?? null;
+        const expirationDays = resolveUploadExpirationDays(body.expirationDays, maxFileLifetimeDays);
+        const expiration = expirationToISO(expirationDays);
         const requestedEntryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
         let entryId = generateID();
         let objectKey = entryId;
         let isUpdate = 0;
         let expectedVersion: number | null = null;
         if (requestedEntryId) {
-          const existing = await getEntryById(env, requestedEntryId);
+          const existing = await getEntryById(env, requestedEntryId, ownerFilter);
           if (!existing) return json({ error: "not found" }, 404);
+          const expiredResponse = await rejectExpiredEntry(env, existing);
+          if (expiredResponse) return expiredResponse;
           if (filename !== existing.filename) {
             return json({ error: "updated file must keep the same filename" }, 400);
           }
@@ -4407,13 +7065,26 @@ export default {
           isUpdate = 1;
         }
         const upload = await env.BUCKET.createMultipartUpload(objectKey, { httpMetadata: { contentType } });
-        await env.DB.prepare(
-          `INSERT INTO multipart_uploads
-            (upload_id, entry_id, filename, content_type, size, expiration_time, note, is_update, expected_version, object_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-          .bind(upload.uploadId, entryId, filename, contentType, Math.floor(size), expiration, note, isUpdate, expectedVersion, objectKey)
-          .run();
+        if (entitlement && principal.userId && !(await reserveStorageBytes(
+          env, principal.userId, upload.uploadId, size, entitlement.limits.storageBytes,
+        ))) {
+          await env.BUCKET.resumeMultipartUpload(objectKey, upload.uploadId).abort().catch(() => undefined);
+          const stored = await getOwnerStorageBytes(env, principal.userId);
+          return json({ error: "storage quota exceeded", storageUsed: stored, storageLimit: entitlement.limits.storageBytes }, 413);
+        }
+        try {
+          await env.DB.prepare(
+            `INSERT INTO multipart_uploads
+              (upload_id, entry_id, filename, content_type, size, expiration_time, note, is_update, expected_version, object_key, owner_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+            .bind(upload.uploadId, entryId, filename, contentType, Math.floor(size), expiration, note, isUpdate, expectedVersion, objectKey, ownerId)
+            .run();
+        } catch (err) {
+          if (principal.userId) await releaseStorageReservation(env, upload.uploadId, principal.userId);
+          await env.BUCKET.resumeMultipartUpload(objectKey, upload.uploadId).abort().catch(() => undefined);
+          throw err;
+        }
         return json({
           uploadId: upload.uploadId,
           id: entryId,
@@ -4426,62 +7097,135 @@ export default {
         const uploadId = decodeURIComponent(seg[5] || "");
         const partNumber = parseMultipartPartNumber(seg[6] || null);
         if (!uploadId || !partNumber) return json({ error: "invalid upload id or part number" }, 400);
-        const upload = await getMultipartUploadById(env, uploadId);
+        const upload = await getMultipartUploadById(env, uploadId, ownerFilter);
         if (!upload) return json({ error: "multipart upload not found" }, 404);
+        if (upload.complete_token) return json({ error: "multipart upload is completing" }, 409);
 
         const bytes = await request.arrayBuffer();
-        const multipart = env.BUCKET.resumeMultipartUpload(upload.object_key || upload.entry_id, upload.upload_id);
-        const part = await multipart.uploadPart(partNumber, bytes);
-        await env.DB.prepare(
-          `INSERT OR REPLACE INTO multipart_upload_parts (upload_id, part_number, etag)
-           VALUES (?, ?, ?)`,
-        )
-          .bind(uploadId, part.partNumber, part.etag)
-          .run();
-        return json({ ok: true, partNumber: part.partNumber });
+        const ownerClause = ownerFilter ? " AND owner_id = ?" : "";
+        const activePart = await env.DB.prepare(
+          `UPDATE multipart_uploads
+           SET active_parts = active_parts + 1, active_parts_updated_at = CURRENT_TIMESTAMP
+           WHERE upload_id = ?${ownerClause} AND complete_token IS NULL`,
+        ).bind(...(ownerFilter ? [uploadId, ownerFilter] : [uploadId])).run();
+        if (activePart.meta.changes !== 1) return json({ error: "multipart upload is completing" }, 409);
+
+        try {
+          const multipart = env.BUCKET.resumeMultipartUpload(upload.object_key || upload.entry_id, upload.upload_id);
+          const part = await multipart.uploadPart(partNumber, bytes);
+          const [savedPart, releasedPart] = await env.DB.batch([
+            env.DB.prepare(
+              `INSERT OR REPLACE INTO multipart_upload_parts (upload_id, part_number, etag)
+               SELECT ?, ?, ? WHERE EXISTS (
+                 SELECT 1 FROM multipart_uploads
+                 WHERE upload_id = ? AND complete_token IS NULL AND active_parts > 0
+               )`,
+            ).bind(uploadId, part.partNumber, part.etag, uploadId),
+            env.DB.prepare(
+              `UPDATE multipart_uploads SET active_parts = active_parts - 1, active_parts_updated_at = CURRENT_TIMESTAMP
+               WHERE upload_id = ? AND complete_token IS NULL AND active_parts > 0`,
+            ).bind(uploadId),
+          ]);
+          if (savedPart.meta.changes !== 1 || releasedPart.meta.changes !== 1) {
+            return json({ error: "multipart upload is completing" }, 409);
+          }
+          return json({ ok: true, partNumber: part.partNumber });
+        } catch (err) {
+          await env.DB.prepare(
+            `UPDATE multipart_uploads
+             SET active_parts = MAX(0, active_parts - 1), active_parts_updated_at = CURRENT_TIMESTAMP
+             WHERE upload_id = ? AND complete_token IS NULL AND active_parts > 0`,
+          ).bind(uploadId).run().catch(() => undefined);
+          throw err;
+        }
       }
 
       if (url.pathname === "/api/entry/multipart/complete" && request.method === "POST") {
         const body = (await request.json()) as { uploadId?: unknown };
         const uploadId = typeof body.uploadId === "string" ? body.uploadId : "";
         if (!uploadId) return json({ error: "uploadId is required" }, 400);
-        const upload = await getMultipartUploadById(env, uploadId);
+        const upload = await getMultipartUploadById(env, uploadId, ownerFilter);
         if (!upload) return json({ error: "multipart upload not found" }, 404);
-        const parts = await env.DB.prepare(
-          `SELECT part_number AS partNumber, etag
-           FROM multipart_upload_parts
-           WHERE upload_id = ?
-           ORDER BY part_number ASC`,
-        )
-          .bind(uploadId)
-          .all<{ partNumber: number; etag: string }>();
+        const completionToken = generateID();
+        if (!(await claimMultipartCompletion(env, uploadId, ownerFilter || null, completionToken))) {
+          return json({ error: "multipart upload is already completing" }, 409);
+        }
+        let parts: D1Result<{ partNumber: number; etag: string }>;
+        try {
+          parts = await env.DB.prepare(
+            `SELECT part_number AS partNumber, etag
+             FROM multipart_upload_parts
+             WHERE upload_id = ?
+             ORDER BY part_number ASC`,
+          ).bind(uploadId).all<{ partNumber: number; etag: string }>();
+        } catch (err) {
+          await releaseMultipartCompletionClaim(env, uploadId, completionToken).catch(() => undefined);
+          return json({ error: String((err as Error)?.message || err) }, 500);
+        }
         if (!parts.results.length) {
+          await releaseMultipartCompletionClaim(env, uploadId, completionToken).catch(() => undefined);
           return json({ error: "no uploaded parts found" }, 400);
         }
 
-        const existingEntry = upload.is_update ? await getEntryById(env, upload.entry_id) : null;
-        if (upload.is_update && !existingEntry) return json({ error: "not found" }, 404);
+        const uploadObjectKey = upload.object_key || upload.entry_id;
+        const cleanup = (deleteObject = false) => cleanupMultipartUpload(
+          env, uploadId, uploadObjectKey, upload.entry_id, principal.userId || undefined,
+          completionToken, deleteObject,
+        );
+        const existingEntry = upload.is_update ? await getEntryById(env, upload.entry_id, ownerFilter) : null;
+        if (upload.is_update && !existingEntry) {
+          await cleanup();
+          return json({ error: "not found" }, 404);
+        }
+        if (existingEntry && isExpired(existingEntry.expiration_time)) {
+          await deleteEntryById(env, existingEntry.id);
+          await cleanup();
+          return json({ error: "file expired" }, 410);
+        }
         if (
           existingEntry &&
           upload.expected_version !== null &&
           Math.max(1, Number(existingEntry.version || 1)) !== upload.expected_version
         ) {
+          await cleanup();
           return json({ error: "file changed while updating; please reload and try again" }, 409);
         }
-        if (existingEntry) await snapshotCurrentFileVersion(env, existingEntry);
 
-        const uploadObjectKey = upload.object_key || upload.entry_id;
-        const multipart = env.BUCKET.resumeMultipartUpload(uploadObjectKey, upload.upload_id);
-        await multipart.complete(parts.results);
-        const completed = await env.BUCKET.get(uploadObjectKey);
-        if (!completed?.body) return json({ error: "completed file not found" }, 500);
-        const md5 = await md5HexFromStream(completed.body);
-        const contentType = upload.content_type || "application/octet-stream";
         const size = upload.size || 0;
+        if (entitlement && size > entitlement.limits.maxFileBytes) {
+          await cleanup();
+          return json({ error: "file exceeds this plan's per-file limit", maxFileBytes: entitlement.limits.maxFileBytes }, 413);
+        }
+        if (entitlement && principal.userId) {
+          const totals = await env.DB.prepare(
+            `SELECT
+               (SELECT COALESCE(SUM(size), 0) FROM entries WHERE owner_id = ?) +
+               (SELECT COALESCE(SUM(history.size), 0) FROM file_versions history
+                JOIN entries e ON e.id = history.entry_id
+                WHERE e.owner_id = ? AND history.version < COALESCE(e.version, 1)) +
+               (SELECT COALESCE(SUM(reserved_bytes), 0) FROM saas_storage_reservations
+                WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP) AS total`,
+          ).bind(principal.userId, principal.userId, principal.userId).first<{ total: number }>();
+          if (Number(totals?.total || 0) > entitlement.limits.storageBytes) {
+            await cleanup();
+            return json({ error: "storage quota exceeded", storageUsed: await getOwnerStorageBytes(env, principal.userId), storageLimit: entitlement.limits.storageBytes }, 413);
+          }
+        }
+        const contentType = upload.content_type || "application/octet-stream";
         let resultingVersion = 1;
+        let md5 = "";
 
-        if (existingEntry) {
-          try {
+        try {
+          const multipart = env.BUCKET.resumeMultipartUpload(uploadObjectKey, upload.upload_id);
+          await multipart.complete(parts.results);
+          const completed = await env.BUCKET.get(uploadObjectKey);
+          if (!completed?.body) throw Object.assign(new Error("completed file not found"), { status: 500 });
+          if (completed.size !== size) {
+            throw Object.assign(new Error("uploaded byte count does not match the declared size"), { status: 400 });
+          }
+          md5 = await md5HexFromStream(completed.body);
+          if (existingEntry) {
+            await snapshotCurrentFileVersion(env, existingEntry);
             resultingVersion = await commitFileContentUpdate(
               env,
               existingEntry,
@@ -4490,31 +7234,30 @@ export default {
               md5,
               uploadObjectKey,
               upload.expected_version || Math.max(1, Number(existingEntry.version || 1)),
+              entitlement && principal.userId ? { id: uploadId, ownerId: principal.userId, consumeBytes: size } : undefined,
+              { uploadId, token: completionToken },
             );
-          } catch (err) {
-            await env.BUCKET.delete(uploadObjectKey);
-            await env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id = ?").bind(uploadId).run();
-            await env.DB.prepare("DELETE FROM multipart_uploads WHERE upload_id = ?").bind(uploadId).run();
-            const message = String((err as Error)?.message || err);
-            return json({ error: message }, message.includes("file changed") ? 409 : 500);
+          } else {
+            await saveNewFileEntry(env, {
+              id: upload.entry_id,
+              filename: upload.filename,
+              contentType,
+              size,
+              md5,
+              expiration: upload.expiration_time,
+              note: upload.note,
+              ownerId: ownerId || LOCAL_OWNER_ID,
+            }, entitlement && principal.userId ? { id: uploadId, consumeBytes: size, final: true } : undefined,
+            { uploadId, token: completionToken });
           }
-        } else {
-          await env.DB.prepare(
-            `INSERT INTO entries
-              (id, filename, content_type, size, md5, version, updated_time, expiration_time, note)
-             VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?)`,
-          )
-            .bind(upload.entry_id, upload.filename, contentType, size, md5, upload.expiration_time, upload.note)
-            .run();
-          await recordNewFileVersion(
-            env,
-            { id: upload.entry_id, filename: upload.filename, content_type: contentType, size },
-            1,
-            md5,
-          );
+        } catch (err) {
+          await cleanup(true);
+          const message = String((err as Error)?.message || err);
+          const status = Number((err as Error & { status?: number })?.status || 0);
+          return json({ error: message }, status || (message.includes("file changed") ? 409 : 500));
         }
-        await env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id = ?").bind(uploadId).run();
-        await env.DB.prepare("DELETE FROM multipart_uploads WHERE upload_id = ?").bind(uploadId).run();
+        if (saasEnabled && principal.userId) await recordUploadBytes(env, principal.userId, size).catch(() => undefined);
+        await cleanup().catch(() => undefined);
         return json({ id: upload.entry_id, filename: upload.filename, version: resultingVersion, md5 });
       }
 
@@ -4522,15 +7265,16 @@ export default {
         const body = (await request.json()) as { uploadId?: unknown };
         const uploadId = typeof body.uploadId === "string" ? body.uploadId : "";
         if (!uploadId) return json({ error: "uploadId is required" }, 400);
-        const upload = await getMultipartUploadById(env, uploadId);
+        const upload = await getMultipartUploadById(env, uploadId, ownerFilter);
         if (upload) {
-          try {
-            await env.BUCKET.resumeMultipartUpload(upload.object_key || upload.entry_id, upload.upload_id).abort();
-          } catch {
-            // Ignore abort failures so local metadata can still be cleaned.
+          const abortToken = generateID();
+          if (!(await claimMultipartCompletion(env, uploadId, ownerFilter || null, abortToken, true))) {
+            return json({ error: "multipart upload is completing" }, 409);
           }
-          await env.DB.prepare("DELETE FROM multipart_upload_parts WHERE upload_id = ?").bind(uploadId).run();
-          await env.DB.prepare("DELETE FROM multipart_uploads WHERE upload_id = ?").bind(uploadId).run();
+          await cleanupMultipartUpload(
+            env, uploadId, upload.object_key || upload.entry_id, upload.entry_id,
+            principal.userId || undefined, abortToken, true,
+          );
         }
         return json({ ok: true });
       }
@@ -4545,10 +7289,7 @@ export default {
         }
 
         const id = generateID();
-        const note = ((fd.get("note") as string | null) || "").trim() || null;
-        const expirationDays = parseExpirationDays((fd.get("expirationDays") as string | null) || null);
-        const expiration = expirationToISO(expirationDays);
-
+        const note = ((fd.get("note") as string | null) || "").trim().slice(0, 1000) || null;
         let filename = `paste-${id}.txt`;
         let contentType = "text/plain";
         let bytes: ArrayBuffer | Uint8Array;
@@ -4564,24 +7305,49 @@ export default {
           size = bytes.byteLength;
         }
 
-        await env.BUCKET.put(id, bytes, { httpMetadata: { contentType } });
+        const maxFileLifetimeDays = entitlement?.limits.maxFileLifetimeDays ?? null;
+        const expirationDays = resolveUploadExpirationDays(fd.get("expirationDays"), maxFileLifetimeDays);
+        const expiration = expirationToISO(expirationDays);
+        if (entitlement && size > entitlement.limits.maxFileBytes) {
+          return json({ error: "file exceeds this plan's per-file limit", maxFileBytes: entitlement.limits.maxFileBytes }, 413);
+        }
+        const storageReservationId = entitlement && principal.userId ? generateID() : null;
+        if (storageReservationId && !(await reserveStorageBytes(
+          env, principal.userId!, storageReservationId, size, entitlement!.limits.storageBytes,
+        ))) {
+          const stored = await getOwnerStorageBytes(env, principal.userId!);
+          return json({ error: "storage quota exceeded", storageUsed: stored, storageLimit: entitlement!.limits.storageBytes }, 413);
+        }
+
         const md5 = md5Hex(bytes);
-        await env.DB.prepare(
-          `INSERT INTO entries
-            (id, filename, content_type, size, md5, version, updated_time, expiration_time, note)
-           VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?)`,
-        )
-          .bind(id, filename, contentType, size, md5, expiration, note)
-          .run();
-        await recordNewFileVersion(env, { id, filename, content_type: contentType, size }, 1, md5);
+        try {
+          await env.BUCKET.put(id, bytes, { httpMetadata: { contentType } });
+          await saveNewFileEntry(env, {
+            id,
+            filename,
+            contentType,
+            size,
+            md5,
+            expiration,
+            note,
+            ownerId: ownerId || LOCAL_OWNER_ID,
+          }, storageReservationId ? { id: storageReservationId, consumeBytes: size, final: true } : undefined);
+        } catch (err) {
+          if (storageReservationId) await releaseStorageReservation(env, storageReservationId, principal.userId || undefined);
+          await env.BUCKET.delete(id).catch(() => undefined);
+          throw err;
+        }
+        if (saasEnabled && principal.userId) await recordUploadBytes(env, principal.userId, size);
 
         return json({ id, filename, md5 });
       }
 
       if (url.pathname.startsWith("/api/entry/") && url.pathname.endsWith("/content") && (request.method === "POST" || request.method === "PUT")) {
         const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-        const entry = await getEntryById(env, id);
+        const entry = await getEntryById(env, id, ownerFilter);
         if (!entry) return json({ error: "not found" }, 404);
+        const expiredResponse = await rejectExpiredEntry(env, entry);
+        if (expiredResponse) return expiredResponse;
 
         const fd = await request.formData();
         const fileValue = fd.get("file");
@@ -4603,19 +7369,42 @@ export default {
           return json({ error: "file changed while updating; please reload and try again" }, 409);
         }
         const bytes = await file.arrayBuffer();
-        await snapshotCurrentFileVersion(env, entry);
+        if (entitlement && bytes.byteLength > entitlement.limits.maxFileBytes) {
+          return json({ error: "file exceeds this plan's per-file limit", maxFileBytes: entitlement.limits.maxFileBytes }, 413);
+        }
         const contentType = file.type || "application/octet-stream";
         const objectKey = newFileVersionObjectKey(id, expectedVersion + 1);
-        await env.BUCKET.put(objectKey, bytes, { httpMetadata: { contentType } });
-        const md5 = md5Hex(bytes);
+        const storageReservationId = entitlement && principal.userId ? generateID() : null;
+        if (storageReservationId && !(await reserveStorageBytes(
+          env, principal.userId!, storageReservationId, bytes.byteLength, entitlement!.limits.storageBytes,
+        ))) {
+          const stored = await getOwnerStorageBytes(env, principal.userId!);
+          return json({ error: "storage quota exceeded", storageUsed: stored, storageLimit: entitlement!.limits.storageBytes }, 413);
+        }
+        let md5 = "";
         let version: number;
         try {
-          version = await commitFileContentUpdate(env, entry, contentType, bytes.byteLength, md5, objectKey, expectedVersion);
+          md5 = md5Hex(bytes);
+          await snapshotCurrentFileVersion(env, entry);
+          await env.BUCKET.put(objectKey, bytes, { httpMetadata: { contentType } });
+          version = await commitFileContentUpdate(
+            env, entry, contentType, bytes.byteLength, md5, objectKey, expectedVersion,
+            storageReservationId ? { id: storageReservationId, ownerId: principal.userId!, consumeBytes: bytes.byteLength } : undefined,
+          );
         } catch (err) {
-          await env.BUCKET.delete(objectKey);
+          if (storageReservationId) {
+            await releaseStorageReservation(env, storageReservationId, principal.userId || undefined).catch(() => undefined);
+          }
+          const references = await env.DB.prepare(
+            `SELECT
+               EXISTS(SELECT 1 FROM entries WHERE id = ? AND COALESCE(current_object_key, id) = ?) OR
+               EXISTS(SELECT 1 FROM file_versions WHERE object_key = ?) AS referenced`,
+          ).bind(entry.id, objectKey, objectKey).first<{ referenced: number }>().catch(() => ({ referenced: 1 }));
+          if (references && !references.referenced) await env.BUCKET.delete(objectKey).catch(() => undefined);
           const message = String((err as Error)?.message || err);
           return json({ error: message }, message.includes("file changed") ? 409 : 500);
         }
+        if (saasEnabled && principal.userId) await recordUploadBytes(env, principal.userId, bytes.byteLength);
         return json({ ok: true, id, filename: entry.filename, version, md5 });
       }
 
@@ -4639,15 +7428,21 @@ export default {
              FROM download_events
              GROUP BY entry_id
            ) d ON d.entry_id = e.id
+           WHERE (? IS NULL OR e.owner_id = ?)
+             AND (e.expiration_time IS NULL OR datetime(e.expiration_time) > CURRENT_TIMESTAMP)
            ORDER BY e.upload_time DESC`,
-        ).all();
+        ).bind(ownerFilter ?? null, ownerFilter ?? null).all();
         return json(res.results);
       }
 
       if (url.pathname.startsWith("/api/entry/") && url.pathname.endsWith("/versions") && request.method === "GET") {
         const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-        const entry = await getEntryById(env, id);
+        const entry = await getEntryById(env, id, ownerFilter);
         if (!entry) return json({ error: "not found" }, 404);
+        if (isExpired(entry.expiration_time)) {
+          await deleteEntryById(env, id);
+          return json({ error: "file expired" }, 410);
+        }
         const versions = await listFileVersions(env, entry);
         return json({
           versions: versions.map(({ object_key: _objectKey, ...version }) => version),
@@ -4659,8 +7454,12 @@ export default {
         const id = decodeURIComponent(parts[3] || "");
         const version = Number(parts[5] || 0);
         if (!Number.isInteger(version) || version <= 0) return json({ error: "invalid version" }, 400);
-        const entry = await getEntryById(env, id);
+        const entry = await getEntryById(env, id, ownerFilter);
         if (!entry) return json({ error: "not found" }, 404);
+        if (isExpired(entry.expiration_time)) {
+          await deleteEntryById(env, id);
+          return json({ error: "file expired" }, 410);
+        }
         let fileVersion = await getFileVersion(env, id, version);
         if (!fileVersion) {
           await listFileVersions(env, entry);
@@ -4680,8 +7479,10 @@ export default {
 
       if (url.pathname.startsWith("/api/entry/") && !url.pathname.endsWith("/downloads") && request.method === "GET") {
         const id = decodeURIComponent(url.pathname.split("/").pop() || "");
-        const entry = await getEntryById(env, id);
+        const entry = await getEntryById(env, id, ownerFilter);
         if (!entry) return json({ error: "not found" }, 404);
+        const expiredResponse = await rejectExpiredEntry(env, entry);
+        if (expiredResponse) return expiredResponse;
 
         const count = await env.DB.prepare(
           "SELECT COUNT(*) as count FROM download_events WHERE entry_id = ?",
@@ -4696,6 +7497,10 @@ export default {
         const parts = url.pathname.split("/");
         const id = decodeURIComponent(parts[3] || "");
         const uniqueIps = url.searchParams.get("uniqueIps") === "1";
+        const entry = await getEntryById(env, id, ownerFilter);
+        if (!entry) return json({ error: "not found" }, 404);
+        const expiredResponse = await rejectExpiredEntry(env, entry);
+        if (expiredResponse) return expiredResponse;
 
         const totalRes = await env.DB.prepare(
           "SELECT COUNT(*) as count FROM download_events WHERE entry_id = ?",
@@ -4726,8 +7531,10 @@ export default {
 
       if (url.pathname.startsWith("/api/entry/") && request.method === "PUT") {
         const id = decodeURIComponent(url.pathname.split("/").pop() || "");
-        const entry = await getEntryById(env, id);
+        const entry = await getEntryById(env, id, ownerFilter);
         if (!entry) return json({ error: "not found" }, 404);
+        const expiredResponse = await rejectExpiredEntry(env, entry);
+        if (expiredResponse) return expiredResponse;
 
         const body = (await request.json()) as {
           filename?: string;
@@ -4740,12 +7547,26 @@ export default {
         const note = (body.note || "").trim().slice(0, 1000) || null;
         const deleteAfter = Boolean(body.deleteAfterExpiration);
         const expDays = Number(body.expirationDays || 0);
-        const expiration = deleteAfter && expDays > 0 ? expirationToISO(expDays) : null;
+        let expiration: string | null;
+        if (entitlement) {
+          const expirationWasSpecified = body.deleteAfterExpiration !== undefined || body.expirationDays !== undefined;
+          const allowsPermanentStorage = entitlement.limits.maxFileLifetimeDays > 30;
+          if (expirationWasSpecified && (!deleteAfter || !Number.isInteger(expDays) || expDays < 0 || (expDays === 0 && !allowsPermanentStorage))) {
+            return json({ error: "permanent file storage is not available on this plan" }, 400);
+          }
+          if (!expirationWasSpecified) {
+            expiration = entry.expiration_time || expirationToISO(entitlement.limits.maxFileLifetimeDays);
+          } else {
+            expiration = expirationToISO(expDays === 0 ? null : Math.min(expDays, entitlement.limits.maxFileLifetimeDays));
+          }
+        } else {
+          expiration = deleteAfter && expDays > 0 ? expirationToISO(expDays) : null;
+        }
 
         await env.DB.prepare(
-          "UPDATE entries SET filename = ?, note = ?, expiration_time = ? WHERE id = ?",
+          "UPDATE entries SET filename = ?, note = ?, expiration_time = ? WHERE id = ? AND (? IS NULL OR owner_id = ?)",
         )
-          .bind(filename || entry.filename, note, expiration, id)
+          .bind(filename || entry.filename, note, expiration, id, ownerFilter ?? null, ownerFilter ?? null)
           .run();
 
         return json({ ok: true });
@@ -4753,59 +7574,99 @@ export default {
 
       if (url.pathname.startsWith("/api/entry/") && request.method === "DELETE") {
         const id = decodeURIComponent(url.pathname.split("/").pop() || "");
+        const entry = await getEntryById(env, id, ownerFilter);
+        if (!entry) return json({ error: "not found" }, 404);
         await deleteEntryById(env, id);
         return json({ ok: true });
       }
 
       if (url.pathname === "/api/guest-links" && request.method === "GET") {
         const res = await env.DB.prepare(
-          "SELECT id, label, created_time, max_file_bytes, max_file_lifetime_days, max_file_uploads, url_expires, upload_count FROM guest_links ORDER BY COALESCE(created_time, url_expires) DESC",
-        ).all();
+          "SELECT id, label, created_time, max_file_bytes, max_file_lifetime_days, max_file_uploads, url_expires, upload_count FROM guest_links WHERE (? IS NULL OR owner_id = ?) ORDER BY COALESCE(created_time, url_expires) DESC",
+        ).bind(ownerFilter ?? null, ownerFilter ?? null).all();
         return json(res.results);
       }
 
       if (url.pathname === "/api/guest-links" && request.method === "POST") {
         const body = (await request.json()) as {
-          label?: string | null;
-          max_file_bytes?: number | null;
-          max_file_lifetime_days?: number | null;
-          max_file_uploads?: number | null;
-          url_expires?: string | null;
+          label?: unknown;
+          max_file_bytes?: unknown;
+          max_file_lifetime_days?: unknown;
+          max_file_uploads?: unknown;
+          url_expires?: unknown;
         };
 
-        const id = generateID();
-        const label = (body.label || "").trim().slice(0, 120) || null;
-        const maxFileBytes = Number(body.max_file_bytes || 0) || null;
-        const maxFileLife = Number(body.max_file_lifetime_days || 0) || null;
-        const maxFileUploads = Number(body.max_file_uploads || 0) || null;
+        const optionalNonNegativeInteger = (value: unknown): number | null | undefined => {
+          if (value === undefined || value === null || value === "") return null;
+          const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+          if (!Number.isSafeInteger(number) || number < 0) return undefined;
+          return number === 0 ? null : number;
+        };
+        const requestedMaxFileBytes = optionalNonNegativeInteger(body.max_file_bytes);
+        const requestedMaxFileLife = optionalNonNegativeInteger(body.max_file_lifetime_days);
+        const maxFileUploads = optionalNonNegativeInteger(body.max_file_uploads);
+        if (requestedMaxFileBytes === undefined || requestedMaxFileLife === undefined || maxFileUploads === undefined) {
+          return json({ error: "guest link limits must be non-negative integers" }, 400);
+        }
+        if (body.label !== undefined && body.label !== null && typeof body.label !== "string") {
+          return json({ error: "label must be a string" }, 400);
+        }
         const urlExpires = parseDateFromUnknown(body.url_expires);
-
-        await env.DB.prepare(
-          "INSERT INTO guest_links (id, label, max_file_bytes, max_file_lifetime_days, max_file_uploads, url_expires, created_time, upload_count) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0)",
-        )
-          .bind(id, label, maxFileBytes, maxFileLife, maxFileUploads, urlExpires)
-          .run();
+        if (body.url_expires !== undefined && body.url_expires !== null && body.url_expires !== "" && !urlExpires) {
+          return json({ error: "url_expires must be a valid date" }, 400);
+        }
+        const id = generateID();
+        const label = (typeof body.label === "string" ? body.label : "").trim().slice(0, 120) || null;
+        const maxFileBytes = entitlement
+          ? Math.min(requestedMaxFileBytes || entitlement.limits.maxFileBytes, entitlement.limits.maxFileBytes)
+          : requestedMaxFileBytes;
+        const maxFileLife = entitlement
+          ? Math.min(requestedMaxFileLife || entitlement.limits.maxFileLifetimeDays, entitlement.limits.maxFileLifetimeDays)
+          : requestedMaxFileLife;
+        const maxUploadCount = maxFileUploads;
+        const maxActiveLinks = entitlement && ownerFilter ? entitlement.limits.maxGuestLinks : null;
+        const insertResult = await env.DB.prepare(
+          `INSERT INTO guest_links
+             (id, label, max_file_bytes, max_file_lifetime_days, max_file_uploads, url_expires, created_time, upload_count, owner_id)
+           SELECT ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0, ?
+           WHERE ? IS NULL OR
+             (SELECT COUNT(*) FROM guest_links
+              WHERE owner_id = ? AND (url_expires IS NULL OR julianday(url_expires) > julianday('now'))) < ?`,
+        ).bind(
+          id, label, maxFileBytes, maxFileLife, maxUploadCount, urlExpires, ownerId,
+          maxActiveLinks, ownerFilter, maxActiveLinks,
+        ).run();
+        if (Number(insertResult.meta.changes || 0) !== 1) {
+          return json({ error: "guest upload link limit reached", limit: maxActiveLinks }, 403);
+        }
 
         return json({ id });
       }
 
       if (url.pathname.startsWith("/api/guest-links/") && request.method === "DELETE") {
         const id = decodeURIComponent(url.pathname.split("/").pop() || "");
-        await env.DB.prepare("DELETE FROM guest_links WHERE id = ?").bind(id).run();
+        await env.DB.prepare("DELETE FROM guest_links WHERE id = ? AND (? IS NULL OR owner_id = ?)")
+          .bind(id, ownerFilter ?? null, ownerFilter ?? null).run();
         return json({ ok: true });
       }
 
       if (url.pathname === "/api/settings" && request.method === "GET") {
+        const storeForeverKey = ownerFilter ? `${ownerFilter}:store_forever` : "store_forever";
+        const defaultDaysKey = ownerFilter ? `${ownerFilter}:default_expiration_days` : "default_expiration_days";
         const rows = await env.DB.prepare(
-          "SELECT key, value FROM settings WHERE key IN ('store_forever', 'default_expiration_days')",
-        ).all<{ key: string; value: string }>();
+          "SELECT key, value FROM settings WHERE key IN (?, ?)",
+        ).bind(storeForeverKey, defaultDaysKey).all<{ key: string; value: string }>();
 
         const map = new Map<string, string>();
         for (const r of rows.results) map.set(r.key, r.value);
 
+        const defaultDaysSetting = map.get(defaultDaysKey);
+        const defaultDays = Number(defaultDaysSetting ?? (entitlement ? String(entitlement.limits.maxFileLifetimeDays) : "30"));
         return json({
-          storeForever: boolFromSetting(map.get("store_forever") ?? "1"),
-          defaultDays: Number(map.get("default_expiration_days") ?? "30"),
+          storeForever: entitlement
+            ? defaultDaysSetting === "0" && entitlement.limits.maxFileLifetimeDays > 30
+            : boolFromSetting(map.get(storeForeverKey) ?? "1"),
+          defaultDays: defaultDays === 0 ? 0 : Math.min(defaultDays, entitlement?.limits.maxFileLifetimeDays || 3650),
         });
       }
 
@@ -4815,14 +7676,27 @@ export default {
           defaultDays?: number;
         };
 
-        const storeForever = body.storeForever ? "1" : "0";
-        const defaultDays = String(Math.max(1, Math.min(3650, Number(body.defaultDays || 30))));
+        const requestedDefaultDays = Number(body.defaultDays ?? (entitlement ? entitlement.limits.maxFileLifetimeDays : 30));
+        const allowsPermanentStorage = Boolean(entitlement && entitlement.limits.maxFileLifetimeDays > 30);
+        if (!Number.isInteger(requestedDefaultDays) || requestedDefaultDays < 0 || (requestedDefaultDays === 0 && !allowsPermanentStorage)) {
+          return json({ error: "defaultDays must be a positive integer, or 0 for Pro permanent storage" }, 400);
+        }
+        if (entitlement && body.storeForever === true && !allowsPermanentStorage) {
+          return json({ error: "permanent file storage is not available on this plan" }, 400);
+        }
+        const storeForever = entitlement
+          ? (requestedDefaultDays === 0 ? "1" : "0")
+          : (body.storeForever ? "1" : "0");
+        const maxDays = entitlement?.limits.maxFileLifetimeDays || 3650;
+        const defaultDays = String(requestedDefaultDays === 0 ? 0 : Math.min(maxDays, requestedDefaultDays));
+        const storeForeverKey = ownerFilter ? `${ownerFilter}:store_forever` : "store_forever";
+        const defaultDaysKey = ownerFilter ? `${ownerFilter}:default_expiration_days` : "default_expiration_days";
 
-        await env.DB.prepare("REPLACE INTO settings(key, value) VALUES ('store_forever', ?)")
-          .bind(storeForever)
+        await env.DB.prepare("REPLACE INTO settings(key, value) VALUES (?, ?)")
+          .bind(storeForeverKey, storeForever)
           .run();
-        await env.DB.prepare("REPLACE INTO settings(key, value) VALUES ('default_expiration_days', ?)")
-          .bind(defaultDays)
+        await env.DB.prepare("REPLACE INTO settings(key, value) VALUES (?, ?)")
+          .bind(defaultDaysKey, defaultDays)
           .run();
 
         return json({ ok: true });
@@ -4830,14 +7704,14 @@ export default {
 
       if (url.pathname === "/api/system-info" && request.method === "GET") {
         const entryStats = await env.DB.prepare(
-          "SELECT COALESCE(SUM(size), 0) AS total, COUNT(*) AS count FROM entries",
-        ).first<{ total: number; count: number }>();
+          "SELECT COALESCE(SUM(size), 0) AS total, COUNT(*) AS count FROM entries WHERE (? IS NULL OR owner_id = ?)",
+        ).bind(ownerFilter ?? null, ownerFilter ?? null).first<{ total: number; count: number }>();
         const guestStats = await env.DB.prepare(
-          "SELECT COUNT(*) AS count FROM guest_links",
-        ).first<{ count: number }>();
+          "SELECT COUNT(*) AS count FROM guest_links WHERE (? IS NULL OR owner_id = ?)",
+        ).bind(ownerFilter ?? null, ownerFilter ?? null).first<{ count: number }>();
         const downloadStats = await env.DB.prepare(
-          "SELECT COUNT(*) AS count FROM download_events",
-        ).first<{ count: number }>();
+          "SELECT COUNT(*) AS count FROM download_events d WHERE (? IS NULL OR EXISTS (SELECT 1 FROM entries e WHERE e.id = d.entry_id AND e.owner_id = ?))",
+        ).bind(ownerFilter ?? null, ownerFilter ?? null).first<{ count: number }>();
 
         const uploadDataBytes = Number(entryStats?.total || 0);
 
@@ -4860,17 +7734,24 @@ export default {
         const decoded = decodeURIComponent(rawPath);
         const slug = sanitizeClipboardSlug(decoded);
         if (slug) {
+          let publicId: string | null = null;
+          if (saasEnabled) {
+            const principal = await resolvePrincipal(request, env, auth, true);
+            if (!principal) return Response.redirect(new URL("/account", url).toString(), 302);
+            const mapping = await getSaasClipboardMapping(env, principal.ownerId, slug);
+            publicId = mapping?.public_id || null;
+          }
           if (decoded !== slug) {
             return Response.redirect(new URL(`/${encodeURIComponent(slug)}`, url).toString(), 302);
           }
-          return new Response(clipboardDetailPage(slug), {
-            headers: withCors({ "Content-Type": "text/html; charset=utf-8" }),
+          return new Response(clipboardDetailPage(slug, saasEnabled, publicId), {
+            headers: withCors({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }),
           });
         }
       }
     }
 
-    return new Response(htmlPage(), {
+    return new Response(htmlPage(saasEnabled, googleLoginEnabled), {
       headers: withCors({ "Content-Type": "text/html; charset=utf-8" }),
     });
   },
