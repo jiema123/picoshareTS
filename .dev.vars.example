@@ -1,3 +1,30 @@
 # Local development secret (do not commit real value)
 PS_SHARED_SECRET=replace-with-a-strong-secret
+# Optional API key for Skills and browser extensions (keep this separate from the UI password).
+# PS_API_KEY=replace-with-a-strong-api-key
+
+# SaaS mode is opt-in. Email/password works with Better Auth; Google OAuth is optional.
+ENABLE_SAAS=false
+BETTER_AUTH_URL=http://localhost:8787
+# BETTER_AUTH_SECRET=use-a-random-secret-at-least-32-characters-long
+# GOOGLE_CLIENT_ID=...
+# GOOGLE_CLIENT_SECRET=...
+# Optional: claim existing self-hosted files/guest links for this first account.
+# SAAS_BOOTSTRAP_EMAIL=you@example.com
+# Optional: comma-separated, verified account emails allowed to grant/revoke Pro without a Waffo transaction.
+# SAAS_SUPERADMIN_EMAILS=admin@example.com
+
+# Waffo Pancake. Create subscription products for monthly and yearly billing.
+WAFFO_ENV=test
+WAFFO_CURRENCY=USD
+# WAFFO_MERCHANT_ID=MER_...
+# WAFFO_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----
+# WAFFO_STORE_ID=STO_...
+# WAFFO_PRODUCT_PRO_MONTHLY=PROD_...
+# WAFFO_PRODUCT_PRO_YEARLY=PROD_...
+# Optional custom key overrides; built-in Waffo test/prod verification keys are used by default.
+# WAFFO_WEBHOOK_PUBLIC_KEY=-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----
+# OPCPay / Alipay checkout is shown only in the Chinese account UI.
+# OPCPAY_API_KEY=yrp_live_...
+# OPCPAY_API_BASE_URL=https://pay.66opc.com/api/pay/v1
 

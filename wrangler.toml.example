@@ -1,11 +1,25 @@
 name = "picoshare-ts"
-main = "src/index.ts"
+main = "src/worker.ts"
 compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
 assets = { directory = "./public" }
 
 [vars]
 # Put the real value in local wrangler.toml or via `wrangler secret put`
 PS_SHARED_SECRET = "replace-me"
+ENABLE_SAAS = "false"
+# Use the canonical public URL so OAuth callbacks and trusted origins stay fixed.
+BETTER_AUTH_URL = "https://share.example.com"
+# SAAS_SUPERADMIN_EMAILS = "admin@example.com"
+WAFFO_ENV = "test"
+WAFFO_CURRENCY = "USD"
+# Set these after creating the Pro subscription products in Waffo Pancake.
+# WAFFO_STORE_ID = "STO_..."
+# WAFFO_PRODUCT_PRO_MONTHLY = "PROD_..."
+# WAFFO_PRODUCT_PRO_YEARLY = "PROD_..."
+# OPCPay / Alipay checkout is shown only in the Chinese account UI.
+# Store the real key as a Worker secret: wrangler secret put OPCPAY_API_KEY
+# OPCPAY_API_BASE_URL = "https://pay.66opc.com/api/pay/v1"
 
 [[d1_databases]]
 binding = "DB"

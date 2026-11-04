@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title data-i18n="PicoShare 分享链接">PicoShare 分享链接</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { display: grid; min-height: 100vh; margin: 0; padding: 24px; place-items: center; color: #26354d; background: #eef1f8; font: 15px/1.6 system-ui, sans-serif; }
+    main { width: min(100%, 620px); padding: 26px; border: 1px solid #ffffffb8; border-radius: 18px; background: #ffffffc9; box-shadow: 0 18px 55px #45587918; }
+    .mark { display: block; width: 52px; height: 52px; margin-bottom: 16px; object-fit: contain; }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    p { margin: 8px 0; color: #67768e; }
+    #share-link { display: block; margin: 18px 0; padding: 13px; overflow-wrap: anywhere; border: 1px solid #b8dfd2; border-radius: 10px; color: #216f5b; background: #f1fbf7; }
+    #error { color: #a03b35; }
+    button, a.button { display: inline-block; padding: 10px 14px; border: 0; border-radius: 9px; color: white; background: #4969d7; font: 600 14px system-ui, sans-serif; text-decoration: none; cursor: pointer; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <img class="mark" src="icons/picoshare.svg" alt="PicoShare" />
+    <h1 id="title" data-i18n="上传完成">上传完成</h1>
+    <p id="description"></p>
+    <p id="error" role="alert"></p>
+    <a id="share-link" class="hidden" target="_blank" rel="noreferrer"></a>
+    <button id="copy" class="hidden" type="button" data-i18n="复制分享链接">复制分享链接</button>
+  </main>
+  <script src="i18n.js"></script>
+  <script src="result.js"></script>
+</body>
+</html>
